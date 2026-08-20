@@ -8,7 +8,7 @@ __version__ = "1.0.0"
 
 # 자동 업데이트를 받아올 GitHub 저장소 (owner/repo).
 # 비워두면 업데이트 확인을 하지 않는다. [설정] 탭이나 .env(GITHUB_REPO)로도 지정 가능.
-GITHUB_REPO = ""
+GITHUB_REPO = "xmflrtm2/Clistock"
 
 APP_NAME = "KIS자동매매"
 
