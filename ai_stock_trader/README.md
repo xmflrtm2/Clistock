@@ -369,6 +369,54 @@ exe는 자기 옆의 `.env` / `config` / `data` / `logs` 를 쓰므로, 지금�
 
 ---
 
+## 배포와 자동 업데이트
+
+**저장소에는 소스만, 릴리즈에는 실행 파일만** 올라간다.
+`.gitignore` 가 `.env`·앱키·DB·로그·exe 를 전부 막고 있다.
+
+### 처음 한 번 (GitHub 저장소 연결)
+
+```bash
+git remote add origin https://github.com/<owner>/<repo>.git
+git branch -M main
+git push -u origin main
+```
+
+### 새 버전 내보내기
+
+```bash
+python release.py 1.0.1        # 버전 올리고 커밋 + 태그
+git push && git push origin v1.0.1
+```
+
+태그를 밀면 `.github/workflows/release.yml` 이 windows-latest 에서 exe를 빌드해
+릴리즈에 붙인다. 태그와 `app/version.py` 가 다르면 빌드가 중단되므로 버전이 어긋날 일이 없다.
+
+직접 빌드해서 올리려면 (`gh` CLI 필요):
+
+```bash
+python release.py 1.0.1 --local
+```
+
+### 사용자 쪽 자동 업데이트
+
+[설정] 탭 → **자동 업데이트** 에 저장소를 `owner/repo` 형식으로 넣으면 된다.
+
+- 시작할 때 최신 릴리즈를 확인하고, 새 버전이 있으면 알려준다
+- 승인하면 내려받아 교체하고 새 버전으로 다시 실행된다
+- **확인 없이 자동 설치** 를 켜면 물어보지 않고 바로 교체한다 (기본 꺼짐)
+
+교체 방식 — 실행 중인 exe는 자기 자신을 덮어쓸 수 없으므로, 프로세스 종료를
+기다렸다 파일을 바꾸고 재실행하는 스크립트를 띄우고 앱은 종료한다.
+원본은 `.exe.bak` 으로 남기고, 교체에 실패하면 되돌린다.
+
+안전장치: 설정된 저장소에서만, HTTPS로만, 허용된 GitHub 호스트에서만 받고,
+크기를 검증한 뒤에 교체한다.
+
+> 소스로 실행 중일 때는 자동 교체를 하지 않는다 (`git pull` 을 쓰라고 안내만 한다).
+
+---
+
 ## 주의
 
 - 이 프로그램은 **도구**이지 투자 조언이 아니다. 수익을 보장하지 않는다.
