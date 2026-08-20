@@ -8,10 +8,19 @@
 """
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
+
+# CI 러너(윈도우)는 콘솔 인코딩이 cp1252 라서 한글을 출력하면 그대로 죽는다.
+# 빌드가 인코딩 때문에 실패하는 건 말이 안 되므로 여기서 먼저 막는다.
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
 
 ROOT = Path(__file__).resolve().parent
 NAME = "KIS자동매매"
@@ -79,6 +88,8 @@ def main() -> int:
 
 def make_shortcut(target: Path) -> None:
     """바탕화면 바로가기 생성 (실패해도 빌드는 성공)."""
+    if os.environ.get("CI") or os.environ.get("GITHUB_ACTIONS"):
+        return                      # 빌드 서버에는 바탕화면이 필요 없다
     desktop = Path.home() / "Desktop"
     if not desktop.exists():
         return

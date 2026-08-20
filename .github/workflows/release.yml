@@ -15,6 +15,11 @@ on:
 permissions:
   contents: write
 
+# 윈도우 러너 콘솔은 기본이 cp1252 라서 한글 출력만으로도 스크립트가 죽는다.
+env:
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: "utf-8"
+
 jobs:
   build:
     runs-on: windows-latest
@@ -56,10 +61,22 @@ jobs:
         working-directory: ai_stock_trader
         run: python build.py
 
+      - name: 빌드 실패 시 진단
+        if: failure()
+        working-directory: ai_stock_trader
+        shell: bash
+        run: |
+          echo "--- 폴더 상태 ---"
+          ls -la || true
+          echo "--- PyInstaller 경고 로그 ---"
+          find build -name "warn-*.txt" -exec tail -50 {} \; 2>/dev/null || true
+
       - name: 산출물 확인
         working-directory: ai_stock_trader
         shell: bash
-        run: ls -la "KIS자동매매.exe"
+        run: |
+          ls -la *.exe
+          test -s "KIS자동매매.exe" || { echo "::error::exe가 만들어지지 않았습니다"; exit 1; }
 
       - name: 릴리즈 생성 및 업로드
         uses: softprops/action-gh-release@v2
@@ -69,7 +86,8 @@ jobs:
           draft: false
           prerelease: false
           generate_release_notes: true
-          files: ai_stock_trader/KIS자동매매.exe
+          fail_on_unmatched_files: true
+          files: ai_stock_trader/*.exe
           body: |
             ## 설치
 
@@ -79,6 +97,9 @@ jobs:
 
             이미 쓰던 분은 프로그램 안에서 자동으로 업데이트되므로 따로 받지 않아도 됩니다.
             ([설정] 탭 → 자동 업데이트)
+
+            > 아래 `Source code (zip/tar.gz)` 는 GitHub가 태그마다 자동으로 붙이는 것이며
+            > 끌 수 없습니다. 실행에 필요한 건 `KIS자동매매.exe` 하나뿐입니다.
 
             > 이 프로그램은 매매 도구이지 투자 조언이 아닙니다. 수익을 보장하지 않습니다.
             > 실전 전환 전에 반드시 모의투자로 충분히 검증하세요.
