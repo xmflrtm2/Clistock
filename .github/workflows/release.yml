@@ -1,0 +1,84 @@
+name: Release
+
+# v1.0.0 같은 태그를 밀면 exe를 빌드해서 릴리즈에 올린다.
+# 소스는 저장소에 있고, 릴리즈 자산으로는 실행 파일만 나간다.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "릴리즈 태그 (예: v1.0.1)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Python 준비
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 의존성 설치
+        working-directory: ai_stock_trader
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: 태그와 app/version.py 일치 확인
+        working-directory: ai_stock_trader
+        shell: bash
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          VER=$(python -c "import re,pathlib;print(re.search(r'__version__ = \"([^\"]+)\"', pathlib.Path('app/version.py').read_text(encoding='utf-8')).group(1))")
+          echo "태그 $TAG / 코드 v$VER"
+          if [ "$TAG" != "v$VER" ]; then
+            echo "::error::태그($TAG)와 app/version.py($VER)가 다릅니다. 버전을 맞춘 뒤 다시 태그하세요."
+            exit 1
+          fi
+
+      - name: 스모크 테스트
+        working-directory: ai_stock_trader
+        run: |
+          python -c "import app.settings, app.storage, app.indicators, app.strategies, app.risk, app.backtest, app.analysis, app.scanner, app.profiles, app.lab, app.updater, app.version; print('import OK')"
+          python -m compileall -q app run.py build.py
+
+      - name: exe 빌드
+        working-directory: ai_stock_trader
+        run: python build.py
+
+      - name: 산출물 확인
+        working-directory: ai_stock_trader
+        shell: bash
+        run: ls -la "KIS자동매매.exe"
+
+      - name: 릴리즈 생성 및 업로드
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          name: KIS 자동매매 ${{ github.event.inputs.tag || github.ref_name }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: ai_stock_trader/KIS자동매매.exe
+          body: |
+            ## 설치
+
+            아래 `KIS자동매매.exe` 를 받아 원하는 폴더에 두고 실행하세요.
+            같은 폴더에 `.env` (KIS 앱키/시크릿/계좌번호)가 있어야 합니다.
+            `config/`, `data/`, `logs/` 폴더는 처음 실행할 때 자동으로 만들어집니다.
+
+            이미 쓰던 분은 프로그램 안에서 자동으로 업데이트되므로 따로 받지 않아도 됩니다.
+            ([설정] 탭 → 자동 업데이트)
+
+            > 이 프로그램은 매매 도구이지 투자 조언이 아닙니다. 수익을 보장하지 않습니다.
+            > 실전 전환 전에 반드시 모의투자로 충분히 검증하세요.

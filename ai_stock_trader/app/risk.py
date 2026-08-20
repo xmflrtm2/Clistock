@@ -1,0 +1,246 @@
+"""자금관리 / 안전장치.
+
+전략이 아무리 좋아도 이 파일이 부실하면 계좌는 죽는다.
+"전략이 실패해도 계좌는 살아남게" 하는 것이 여기 있는 모든 코드의 목적이다.
+
+막는 것:
+  - 1회 거래 과다손실   -> 손절폭 기준 포지션 사이징
+  - 하루 과다손실       -> 일일 손실한도 도달 시 당일 신규진입 차단
+  - 계좌 파괴           -> 누적 낙폭 한도 도달 시 엔진 정지
+  - 연속 손실 후 뇌동매매 -> 쿨다운
+  - 중복/과매매         -> 종목별 주문 잠금 + 재진입 쿨다운 + 일일 주문수 상한
+  - 몰빵                -> 종목당 비중 상한 + 현금 최소보유
+"""
+from __future__ import annotations
+
+import logging
+import math
+import threading
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+
+from .settings import RiskConfig
+from .storage import Store
+
+log = logging.getLogger(__name__)
+
+
+@dataclass
+class RiskState:
+    day: str = ""
+    day_start_equity: float = 0.0
+    peak_equity: float = 0.0
+    halted: bool = False
+    halt_reason: str = ""
+    daily_block: bool = False
+    daily_block_reason: str = ""
+    cooldown_until: datetime | None = None
+    pending: set = field(default_factory=set)
+
+    def to_dict(self, cur_equity: float = 0.0) -> dict:
+        dd = 0.0
+        if self.peak_equity > 0 and cur_equity > 0:
+            dd = (self.peak_equity - cur_equity) / self.peak_equity * 100
+        day_pnl_pct = 0.0
+        if self.day_start_equity > 0 and cur_equity > 0:
+            day_pnl_pct = (cur_equity - self.day_start_equity) / self.day_start_equity * 100
+        return {
+            "halted": self.halted,
+            "halt_reason": self.halt_reason,
+            "daily_block": self.daily_block,
+            "daily_block_reason": self.daily_block_reason,
+            "drawdown_pct": dd,
+            "day_pnl_pct": day_pnl_pct,
+            "cooldown_until": self.cooldown_until.strftime("%H:%M") if self.cooldown_until else "",
+            "pending": sorted(self.pending),
+        }
+
+
+class RiskManager:
+    def __init__(self, cfg: RiskConfig, store: Store, mode: str):
+        self.cfg = cfg
+        self.store = store
+        self.mode = mode
+        self.state = RiskState()
+        self._lock = threading.RLock()
+
+    # -- 하루 경계 ----------------------------------------------------------
+    def roll_day(self, equity: float) -> None:
+        today = datetime.now().strftime("%Y-%m-%d")
+        with self._lock:
+            if self.state.day != today:
+                self.state.day = today
+                self.state.day_start_equity = self.store.day_start_equity(self.mode) or equity
+                self.state.daily_block = False
+                self.state.daily_block_reason = ""
+                self.state.pending.clear()
+                log.info("[리스크] 새 거래일 %s 시작. 기준자산 %s원",
+                         today, f"{self.state.day_start_equity:,.0f}")
+            peak = max(self.store.peak_equity(self.mode), equity)
+            self.state.peak_equity = peak
+
+    # -- 강제 정지 ----------------------------------------------------------
+    def halt(self, reason: str) -> None:
+        with self._lock:
+            self.state.halted = True
+            self.state.halt_reason = reason
+        log.error("[리스크] 엔진 정지: %s", reason)
+
+    def resume(self) -> None:
+        with self._lock:
+            self.state.halted = False
+            self.state.halt_reason = ""
+            self.state.daily_block = False
+            self.state.daily_block_reason = ""
+            self.state.cooldown_until = None
+
+    # -- 주문 잠금 (중복 주문 방지) -----------------------------------------
+    def lock(self, symbol: str) -> bool:
+        with self._lock:
+            if symbol in self.state.pending:
+                return False
+            self.state.pending.add(symbol)
+            return True
+
+    def unlock(self, symbol: str) -> None:
+        with self._lock:
+            self.state.pending.discard(symbol)
+
+    def is_locked(self, symbol: str) -> bool:
+        return symbol in self.state.pending
+
+    # -- 관문 ---------------------------------------------------------------
+    def check_global(self, equity: float) -> tuple[bool, str]:
+        """엔진 전체에 걸리는 관문. 신규 진입 가능한 상태인가."""
+        c = self.cfg
+        st = self.state
+
+        if st.halted:
+            return False, f"엔진 정지 상태 ({st.halt_reason})"
+
+        # 누적 낙폭
+        if st.peak_equity > 0:
+            dd = (st.peak_equity - equity) / st.peak_equity * 100
+            if dd >= c.max_drawdown_pct:
+                self.halt(f"누적 낙폭 {dd:.2f}% >= 한도 {c.max_drawdown_pct}%")
+                return False, st.halt_reason
+
+        # 일일 손실
+        if st.day_start_equity > 0:
+            day_pnl_pct = (equity - st.day_start_equity) / st.day_start_equity * 100
+            if day_pnl_pct <= -c.max_daily_loss_pct:
+                if not st.daily_block:
+                    st.daily_block = True
+                    st.daily_block_reason = (f"일일 손실 {day_pnl_pct:.2f}% "
+                                             f"<= 한도 -{c.max_daily_loss_pct}%")
+                    log.warning("[리스크] %s -> 당일 신규진입 중단", st.daily_block_reason)
+                return False, st.daily_block_reason
+        if st.daily_block:
+            return False, st.daily_block_reason
+
+        # 연속 손실 쿨다운
+        if st.cooldown_until and datetime.now() < st.cooldown_until:
+            return False, f"연속손실 쿨다운 ({st.cooldown_until.strftime('%H:%M')}까지)"
+
+        # 일일 주문 건수
+        n = self.store.orders_today(self.mode)
+        if n >= c.max_orders_per_day:
+            return False, f"일일 주문 상한 도달 ({n}/{c.max_orders_per_day})"
+
+        return True, ""
+
+    def check_entry(self, symbol: str, equity: float, cash: float,
+                    open_positions: int, sector: str = "",
+                    sector_exposure_pct: float = 0.0) -> tuple[bool, str]:
+        """종목별 진입 관문."""
+        c = self.cfg
+        ok, why = self.check_global(equity)
+        if not ok:
+            return False, why
+
+        if self.is_locked(symbol):
+            return False, "이미 주문 처리 중 (중복 방지)"
+
+        if open_positions >= c.max_positions:
+            return False, f"보유 종목 수 상한 ({open_positions}/{c.max_positions})"
+
+        # 재진입 쿨다운
+        last = self.store.last_exit_time(symbol, self.mode)
+        if last:
+            try:
+                t = datetime.strptime(last, "%Y-%m-%d %H:%M:%S")
+                if datetime.now() - t < timedelta(minutes=c.reentry_cooldown_min):
+                    left = c.reentry_cooldown_min - int((datetime.now() - t).total_seconds() / 60)
+                    return False, f"재진입 쿨다운 {left}분 남음"
+            except ValueError:
+                pass
+
+        # 섹터 집중도 - 같은 업종이 한꺼번에 무너지는 상황 방어
+        cap = float(getattr(c, "max_sector_weight_pct", 0) or 0)
+        if sector and cap > 0 and sector_exposure_pct >= cap:
+            return False, (f"'{sector}' 업종 비중 {sector_exposure_pct:.1f}% "
+                           f">= 한도 {cap}%")
+
+        # 현금 여력
+        reserve = equity * c.min_cash_reserve_pct / 100
+        if cash - reserve < c.min_order_amount:
+            return False, (f"현금 부족 (가용 {max(cash - reserve, 0):,.0f}원 "
+                           f"< 최소주문 {c.min_order_amount:,}원)")
+
+        return True, ""
+
+    # -- 포지션 사이징 -------------------------------------------------------
+    def position_size(self, price: float, stop: float, equity: float,
+                      cash: float, strength: float = 1.0) -> tuple[int, str]:
+        """손절폭 기준으로 수량을 정한다.
+
+        핵심: "얼마 살까"가 아니라 "틀렸을 때 얼마 잃을까"에서 역산한다.
+        """
+        c = self.cfg
+        if price <= 0:
+            return 0, "가격 오류"
+
+        stop_dist = price - stop if stop > 0 else 0
+        if stop_dist <= 0:
+            stop_dist = price * 0.03           # 손절 미지정 시 3% 가정
+        # 손절이 비정상적으로 멀면 자르지 않고 수량으로 흡수 (사이징이 알아서 줄인다)
+
+        risk_amount = equity * c.max_loss_per_trade_pct / 100 * max(min(strength, 1.0), 0.1)
+        qty_risk = risk_amount / stop_dist
+
+        qty_weight = (equity * c.max_position_weight_pct / 100) / price
+        reserve = equity * c.min_cash_reserve_pct / 100
+        qty_cash = max(cash - reserve, 0) / price
+        qty_cap = c.max_order_amount / price
+
+        qty = int(math.floor(min(qty_risk, qty_weight, qty_cash, qty_cap)))
+        if qty <= 0:
+            return 0, (f"수량 0 (리스크기준 {qty_risk:.1f} / 비중 {qty_weight:.1f} / "
+                       f"현금 {qty_cash:.1f} / 상한 {qty_cap:.1f})")
+
+        amount = qty * price
+        if amount < c.min_order_amount:
+            need = math.ceil(c.min_order_amount / price)
+            if need <= min(qty_weight, qty_cash, qty_cap):
+                qty = need
+            else:
+                return 0, f"주문금액 {amount:,.0f}원 < 최소 {c.min_order_amount:,}원"
+
+        binding = min([(qty_risk, "손실한도"), (qty_weight, "종목비중"),
+                       (qty_cash, "현금"), (qty_cap, "1회주문상한")])[1]
+        return qty, (f"{qty}주 x {price:,.0f}원 = {qty * price:,.0f}원 "
+                     f"(제약: {binding}, 손절시 -{qty * stop_dist:,.0f}원 "
+                     f"= 자산의 {qty * stop_dist / equity * 100:.2f}%)")
+
+    # -- 체결/청산 이벤트 ----------------------------------------------------
+    def on_trade_closed(self, pnl: float) -> None:
+        c = self.cfg
+        if pnl >= 0:
+            return
+        n = self.store.consecutive_losses(self.mode)
+        if n >= c.max_consecutive_losses:
+            until = datetime.now() + timedelta(minutes=c.consecutive_loss_cooldown_min)
+            with self._lock:
+                self.state.cooldown_until = until
+            log.warning("[리스크] 연속 손절 %d회 -> %s까지 쿨다운",
+                        n, until.strftime("%H:%M"))
