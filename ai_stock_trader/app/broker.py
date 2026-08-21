@@ -100,10 +100,14 @@ class PaperBroker(Broker):
     def _save(self) -> None:
         self.store.kv_set(self.key, json.dumps(self._acct, ensure_ascii=False))
 
-    def reset(self, cash: int | None = None) -> None:
+    def reset(self, cash: int | None = None, mode: str | None = None) -> None:
+        """가상계좌 초기화. 자산 기록도 함께 지워야 가짜 낙폭이 안 생긴다."""
         self._acct = {"cash": cash or self.initial_cash, "holdings": {},
                       "initial": cash or self.initial_cash}
         self._save()
+        self.store.clear_mode_history(mode or self.mode)
+        log.info("가상계좌 초기화: %s 자금 %s원", mode or self.mode,
+                 f"{cash or self.initial_cash:,}")
 
     def quote(self, symbol: str) -> dict:
         if self.qc is None:

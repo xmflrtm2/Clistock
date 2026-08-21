@@ -71,12 +71,16 @@ jobs:
           echo "--- PyInstaller 경고 로그 ---"
           find build -name "warn-*.txt" -exec tail -50 {} \; 2>/dev/null || true
 
-      - name: 산출물 확인
+      - name: 산출물 확인 및 이름 정리
         working-directory: ai_stock_trader
         shell: bash
         run: |
           ls -la *.exe
           test -s "KIS자동매매.exe" || { echo "::error::exe가 만들어지지 않았습니다"; exit 1; }
+          # GitHub 릴리즈는 자산 이름의 한글을 잘라낸다 (KIS자동매매.exe -> KIS.exe).
+          # 받는 사람이 뭘 받은 건지 알 수 있게 ASCII 이름으로 올린다.
+          cp "KIS자동매매.exe" "Clistock.exe"
+          ls -la Clistock.exe
 
       - name: 릴리즈 생성 및 업로드
         uses: softprops/action-gh-release@v2
@@ -87,11 +91,11 @@ jobs:
           prerelease: false
           generate_release_notes: true
           fail_on_unmatched_files: true
-          files: ai_stock_trader/*.exe
+          files: ai_stock_trader/Clistock.exe
           body: |
             ## 설치
 
-            아래 `KIS자동매매.exe` 를 받아 원하는 폴더에 두고 실행하세요.
+            아래 `Clistock.exe` 를 받아 원하는 폴더에 두고 실행하세요.
             같은 폴더에 `.env` (KIS 앱키/시크릿/계좌번호)가 있어야 합니다.
             `config/`, `data/`, `logs/` 폴더는 처음 실행할 때 자동으로 만들어집니다.
 
@@ -99,7 +103,7 @@ jobs:
             ([설정] 탭 → 자동 업데이트)
 
             > 아래 `Source code (zip/tar.gz)` 는 GitHub가 태그마다 자동으로 붙이는 것이며
-            > 끌 수 없습니다. 실행에 필요한 건 `KIS자동매매.exe` 하나뿐입니다.
+            > 끌 수 없습니다. 실행에 필요한 건 `Clistock.exe` 하나뿐입니다.
 
             > 이 프로그램은 매매 도구이지 투자 조언이 아닙니다. 수익을 보장하지 않습니다.
             > 실전 전환 전에 반드시 모의투자로 충분히 검증하세요.

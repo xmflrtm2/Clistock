@@ -57,6 +57,9 @@ class RiskState:
 
 
 class RiskManager:
+    # 매매 없이 자산이 이만큼 변하면 입출금/초기화로 본다 (%)
+    CAPITAL_JUMP_PCT = 12.0
+
     def __init__(self, cfg: RiskConfig, store: Store, mode: str):
         self.cfg = cfg
         self.store = store
@@ -64,9 +67,53 @@ class RiskManager:
         self.state = RiskState()
         self._lock = threading.RLock()
 
+    # -- 자산 기준선 --------------------------------------------------------
+    def rebaseline(self, equity: float, reason: str) -> None:
+        """낙폭 기준을 지금 자산으로 다시 잡는다.
+
+        계좌 초기화나 입출금은 손실이 아니다. 그런데 예전 최고치를 그대로
+        들고 있으면 낙폭이 부풀려져 엔진이 즉시 멈추고, 재시작해도 DB에서
+        같은 값을 다시 읽어와 영원히 못 돌아간다.
+        """
+        ts = self.store.set_equity_epoch(self.mode)
+        with self._lock:
+            self.state.peak_equity = equity
+            self.state.day_start_equity = equity
+            if self.state.halted and "낙폭" in (self.state.halt_reason or ""):
+                self.state.halted = False
+                self.state.halt_reason = ""
+            self.state.daily_block = False
+            self.state.daily_block_reason = ""
+        log.warning("[리스크] 자산 기준선 재설정 (%s) - 기준 %s원, 기준시각 %s",
+                    reason, f"{equity:,.0f}", ts)
+
+    def _detect_capital_change(self, equity: float) -> str:
+        """매매가 없었는데 자산이 크게 변했으면 입출금/초기화로 본다."""
+        last = self.store.last_equity(self.mode)
+        if not last or not last.get("total_eval"):
+            return ""
+        prev = float(last["total_eval"])
+        if prev <= 0 or equity <= 0:
+            return ""
+        change = abs(equity - prev) / prev * 100
+        if change < self.CAPITAL_JUMP_PCT:
+            return ""
+        # 그 사이에 주문이 있었으면 실제 매매로 인한 변동이다
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if self.store.orders_between(self.mode, last["ts"], now) > 0:
+            return ""
+        return (f"매매 없이 자산이 {prev:,.0f} -> {equity:,.0f} "
+                f"({'+' if equity > prev else '-'}{change:.1f}%) 변동")
+
     # -- 하루 경계 ----------------------------------------------------------
     def roll_day(self, equity: float) -> None:
         today = datetime.now().strftime("%Y-%m-%d")
+
+        # 입출금/계좌초기화 감지가 먼저다. 아니면 아래에서 가짜 낙폭이 잡힌다.
+        why = self._detect_capital_change(equity)
+        if why:
+            self.rebaseline(equity, why)
+
         with self._lock:
             if self.state.day != today:
                 self.state.day = today

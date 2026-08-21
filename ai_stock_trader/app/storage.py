@@ -470,8 +470,44 @@ class Store:
             c.execute("DELETE FROM equity WHERE mode=?", (mode,))
 
     def peak_equity(self, mode: str) -> float:
-        r = self.one("SELECT MAX(total_eval) m FROM equity WHERE mode=?", (mode,))
+        """낙폭 계산용 최고 자산.
+
+        기준시각(epoch) 이후만 본다. 계좌를 초기화하거나 입출금이 있으면
+        그 전의 최고치는 의미가 없다. 안 그러면 500만으로 리셋한 계좌가
+        예전 1000만 기록 때문에 영원히 '낙폭 50%'로 잡힌다.
+        """
+        ep = self.get_equity_epoch(mode)
+        if ep:
+            r = self.one("SELECT MAX(total_eval) m FROM equity WHERE mode=? AND ts>=?",
+                         (mode, ep))
+        else:
+            r = self.one("SELECT MAX(total_eval) m FROM equity WHERE mode=?", (mode,))
         return float(r["m"]) if r and r["m"] else 0.0
+
+    def get_equity_epoch(self, mode: str) -> str:
+        return self.kv_get(f"equity_epoch::{mode}") or ""
+
+    def set_equity_epoch(self, mode: str, ts: str | None = None) -> str:
+        ts = ts or _now()
+        self.kv_set(f"equity_epoch::{mode}", ts)
+        return ts
+
+    def last_equity(self, mode: str) -> dict | None:
+        r = self.one("SELECT ts,total_eval FROM equity WHERE mode=? "
+                     "ORDER BY ts DESC LIMIT 1", (mode,))
+        return dict(r) if r else None
+
+    def orders_between(self, mode: str, t0: str, t1: str) -> int:
+        r = self.one("SELECT COUNT(*) n FROM orders WHERE mode=? AND ts>? AND ts<=?",
+                     (mode, t0, t1))
+        return r["n"] if r else 0
+
+    def clear_mode_history(self, mode: str) -> None:
+        """가상계좌 초기화 시 그 모드의 기록을 지운다."""
+        with self.conn() as c:
+            for t in ("trades", "orders", "signals", "equity"):
+                c.execute(f"DELETE FROM {t} WHERE mode=?", (mode,))
+        self.kv_set(f"equity_epoch::{mode}", "")
 
     def day_start_equity(self, mode: str) -> float | None:
         r = self.one("SELECT total_eval FROM equity WHERE mode=? AND substr(ts,1,10)=? "

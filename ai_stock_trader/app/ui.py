@@ -2158,6 +2158,9 @@ class App(ctk.CTk):
             self.sw_realquote.select()
         self.sw_realquote.pack(side="left", padx=18)
         ctk.CTkButton(row, text="적용", width=80, command=self._apply_settings).pack(side="left")
+        ctk.CTkButton(row, text="낙폭 기준 재설정", width=140, fg_color="#7a4a1f",
+                      hover_color="#96601f",
+                      command=self._rebaseline).pack(side="left", padx=(18, 0))
 
         g = ctk.CTkFrame(p, fg_color=CARD, corner_radius=8)
         g.pack(fill="x", padx=4, pady=(0, 8))
@@ -2303,13 +2306,38 @@ class App(ctk.CTk):
         from .broker import PaperBroker
         pb = PaperBroker(self.core.store, self.core.quote_client,
                          self.core.cfg.cost, self.core.cfg.paper_initial_cash)
-        pb.reset(self.core.cfg.paper_initial_cash)
-        # 자산 이력을 남겨두면 예전 예수금이 최고점으로 남아
-        # 새 예수금이 곧바로 '낙폭 초과'로 계산되고 엔진이 정지한다.
-        self.core.store.clear_equity("PAPER")
+        # reset() 이 자산/주문/거래 기록과 낙폭 기준시각까지 함께 정리한다.
+        # 이력을 남겨두면 예전 예수금이 최고점으로 남아 새 예수금이 곧바로
+        # '낙폭 초과'로 계산되고, 재시작해도 DB에서 같은 값을 읽어와 영원히 멈춘다.
+        pb.reset(self.core.cfg.paper_initial_cash, mode="PAPER")
         self.core.rebuild()
         self._log(f"PAPER 계좌 초기화 완료 (예수금 "
                   f"{self.core.cfg.paper_initial_cash:,}원, 자산이력 리셋)")
+
+    def _rebaseline(self) -> None:
+        """입출금이나 계좌 변경으로 낙폭이 부풀려졌을 때 기준을 지금 자산으로 되돌린다."""
+        eng = self.core.engine
+        st = eng.status()
+        eq = st.get("equity") or 0
+        if eq <= 0:
+            messagebox.showinfo("안내", "계좌 조회가 끝난 뒤에 눌러주세요.")
+            return
+        dd = (st.get("risk") or {}).get("drawdown_pct", 0)
+        msg = "\n".join([
+            f"지금 자산 {eq:,.0f}원을 새 기준으로 잡습니다.",
+            f"현재 계산된 낙폭 {dd:.2f}% 가 0% 가 됩니다.",
+            "",
+            "입금·출금·계좌 초기화처럼 매매와 무관한 변동 때문에",
+            "낙폭이 잘못 잡혔을 때만 쓰세요.",
+            "실제 손실을 지우는 데 쓰면 안전장치가 무력해집니다.",
+            "",
+            "계속할까요?",
+        ])
+        if not messagebox.askyesno("낙폭 기준 재설정", msg):
+            return
+        eng.risk.rebaseline(float(eq), "사용자 수동 재설정")
+        self._log(f"낙폭 기준을 {eq:,.0f}원으로 재설정했습니다.", "risk")
+        self._refresh_now()
 
     def _save_gemini(self) -> None:
         v = self.e_gem.get().strip()
