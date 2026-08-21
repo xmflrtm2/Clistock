@@ -1,0 +1,127 @@
+{
+  "mode": "PAPER",
+  "real_trading_confirmed": false,
+  "watchlist": [
+    "005930",
+    "000660",
+    "035420",
+    "066570",
+    "009150",
+    "012450",
+    "011200",
+    "010140",
+    "000810",
+    "086790",
+    "086280",
+    "010130",
+    "005380",
+    "012330",
+    "096770",
+    "105560",
+    "051910",
+    "032830"
+  ],
+  "paper_initial_cash": 5000000,
+  "risk": {
+    "max_loss_per_trade_pct": 0.5,
+    "max_daily_loss_pct": 2.0,
+    "max_drawdown_pct": 10.0,
+    "max_consecutive_losses": 3,
+    "consecutive_loss_cooldown_min": 60,
+    "max_positions": 5,
+    "max_position_weight_pct": 20.0,
+    "min_order_amount": 50000,
+    "max_order_amount": 2000000,
+    "reentry_cooldown_min": 30,
+    "max_orders_per_day": 40,
+    "max_sector_weight_pct": 40.0,
+    "min_cash_reserve_pct": 10.0
+  },
+  "execution": {
+    "order_type": "best",
+    "limit_slippage_pct": 0.3,
+    "order_timeout_sec": 60,
+    "entry_start": "09:05",
+    "entry_end": "15:00",
+    "force_exit_at": "15:15",
+    "loop_interval_sec": 30
+  },
+  "cost": {
+    "commission_pct": 0.015,
+    "sell_tax_pct": 0.15,
+    "slippage_pct": 0.1
+  },
+  "data": {
+    "use_real_for_quotes": true,
+    "daily_history_days": 1250,
+    "collect_minute": true
+  },
+  "ai": {
+    "enabled": true,
+    "model": "gemini-3.5-flash",
+    "veto_filter": true,
+    "daily_review": true
+  },
+  "notify": {
+    "enabled": false,
+    "kinds": [
+      "trade",
+      "risk",
+      "error"
+    ]
+  },
+  "update": {
+    "repo": "xmflrtm2/Clistock",
+    "check_on_start": true,
+    "auto_install": false
+  },
+  "strategies": [
+    {
+      "name": "volatility_breakout",
+      "enabled": true,
+      "params": {
+        "k": 0.5,
+        "ma_filter": 20,
+        "vol_filter": 1.0,
+        "atr_stop": 2.0,
+        "max_stop_pct": 2.5,
+        "take_profit_pct": 4.0,
+        "trail_atr": 0.0,
+        "breakeven_pct": 1.5,
+        "min_range_pct": 0.8
+      }
+    },
+    {
+      "name": "trend_pullback",
+      "enabled": true,
+      "params": {
+        "fast": 20,
+        "slow": 60,
+        "pullback_lookback": 5,
+        "rsi_period": 14,
+        "rsi_max": 65,
+        "rsi_exit": 72,
+        "atr_stop": 2.0,
+        "max_stop_pct": 8.0,
+        "take_profit_pct": 6.0,
+        "trail_atr": 2.5,
+        "breakeven_pct": 2.0,
+        "max_hold_bars": 15
+      }
+    },
+    {
+      "name": "opening_range_breakout",
+      "enabled": true,
+      "params": {
+        "range_min": 30,
+        "atr_stop": 1.5,
+        "max_stop_pct": 1.5,
+        "take_profit_pct": 2.0,
+        "trail_atr": 2.0,
+        "breakeven_pct": 1.0,
+        "max_chase_pct": 0.4,
+        "entry_deadline": "13:30"
+      }
+    }
+  ]
+}
