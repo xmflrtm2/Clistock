@@ -273,14 +273,17 @@ class App(ctk.CTk):
         body = ctk.CTkFrame(p, fg_color="transparent")
         body.pack(fill="both", expand=True)
 
-        left = ctk.CTkFrame(body, fg_color=CARD, corner_radius=8)
-        left.pack(side="left", fill="both", expand=True, padx=(4, 5))
+        col = ctk.CTkFrame(body, fg_color="transparent")
+        col.pack(side="left", fill="both", expand=True, padx=(4, 5))
+
+        left = ctk.CTkFrame(col, fg_color=CARD, corner_radius=8)
+        left.pack(fill="both", expand=True, pady=(0, 6))
         ctk.CTkLabel(left, text="보유 포지션 (엔진 관리)", anchor="w",
                      font=("", 13, "bold")).pack(fill="x", padx=12, pady=(10, 4))
         self.tv_pos = self._tree(left, [
             ("sym", "종목", 80), ("qty", "수량", 60), ("avg", "평단", 90),
             ("cur", "현재가", 90), ("stop", "손절가", 90), ("target", "목표가", 90),
-            ("pnl", "평가손익", 100), ("pct", "수익률", 80), ("st", "전략", 120)], 9)
+            ("pnl", "평가손익", 100), ("pct", "수익률", 80), ("st", "전략", 120)], 6)
         self.tv_pos.pack(fill="both", expand=True, padx=10, pady=(0, 6))
         row = ctk.CTkFrame(left, fg_color="transparent")
         row.pack(fill="x", padx=10, pady=(0, 10))
@@ -289,6 +292,37 @@ class App(ctk.CTk):
                       command=self._adopt).pack(side="left")
         ctk.CTkButton(row, text="새로고침", width=90, fg_color="#3a3a3a",
                       hover_color="#4a4a4a", command=self._refresh_now).pack(side="left", padx=6)
+
+        # --- 감시 현황: 엔진이 지금 무엇을 보고 있는가 ---
+        watch = ctk.CTkFrame(col, fg_color=CARD, corner_radius=8)
+        watch.pack(fill="both", expand=True)
+        wh = ctk.CTkFrame(watch, fg_color="transparent")
+        wh.pack(fill="x", padx=12, pady=(10, 4))
+        ctk.CTkLabel(wh, text="감시 현황 (실시간 종목 분석)", anchor="w",
+                     font=("", 13, "bold")).pack(side="left")
+        self.lbl_scan = ctk.CTkLabel(wh, text="엔진을 시작하면 관심종목을 전략별로 훑습니다.",
+                                     text_color=MUTED, font=("", 11))
+        self.lbl_scan.pack(side="left", padx=10)
+        ctk.CTkButton(wh, text="지금 한 번 훑기", width=110, height=26,
+                      fg_color="#3a3a3a", hover_color="#4a4a4a",
+                      command=self._scan_once).pack(side="right")
+
+        self.tv_watch_live = self._tree(watch, [
+            ("sym", "종목", 130), ("price", "현재가", 85), ("chg", "등락", 70),
+            ("atr", "변동성", 70), ("st", "전략", 110), ("vd", "판정", 60),
+            ("cond", "조건", 60), ("gap", "트리거까지", 90),
+            ("lv", "손절/목표", 100), ("qty", "예상수량", 75),
+            ("why", "상태", 260)], 9)
+        self.tv_watch_live.pack(fill="both", expand=True, padx=10, pady=(0, 4))
+        self.tv_watch_live.tag_configure("buy", foreground=OK)
+        self.tv_watch_live.tag_configure("near", foreground=WARN)
+        self.tv_watch_live.tag_configure("held", foreground="#7fb3ff")
+        self.tv_watch_live.tag_configure("dim", foreground=MUTED)
+        self.tv_watch_live.bind("<Double-1>", lambda _e: self._open_watch_detail())
+        ctk.CTkLabel(watch, text="행을 더블클릭하면 조건별 판정을 자세히 볼 수 있습니다. "
+                                 "변동성(ATR%)이 큰 종목일수록 손절/목표 폭이 자동으로 넓어집니다.",
+                     text_color=MUTED, anchor="w",
+                     font=("", 10)).pack(fill="x", padx=12, pady=(0, 8))
 
         right = ctk.CTkFrame(body, fg_color=CARD, corner_radius=8, width=470)
         right.pack(side="right", fill="both", padx=(5, 4))
@@ -349,8 +383,9 @@ class App(ctk.CTk):
         right.pack(side="right", fill="both", expand=True, padx=(5, 4))
         self.sub = ctk.CTkTabview(right, anchor="nw", height=430)
         self.sub.pack(fill="both", expand=True, padx=6, pady=6)
-        for n in ("관심종목", "보유종목", "최근조회", "국내순위", "해외순위"):
+        for n in ("관심종목", "감시분석", "보유종목", "최근조회", "국내순위", "해외순위"):
             self.sub.add(n)
+        self._tab_watch_stats(self.sub.tab("감시분석"))
 
         self.tv_watch = self._quote_tree(self.sub.tab("관심종목"))
         w = ctk.CTkFrame(self.sub.tab("관심종목"), fg_color="transparent")
@@ -425,6 +460,82 @@ class App(ctk.CTk):
 
         self._update_master_label()
         self.after(1200, lambda: self._load_list("관심종목"))
+
+    # ------------------------------------------------------------------
+    # 감시 분석 - 관측이 쌓일수록 "어디서 막히는지"가 드러난다
+    # ------------------------------------------------------------------
+    def _tab_watch_stats(self, p) -> None:
+        bar = ctk.CTkFrame(p, fg_color="transparent")
+        bar.pack(fill="x", pady=(6, 4))
+        ctk.CTkLabel(bar, text="기간", font=("", 12)).pack(side="left", padx=(4, 6))
+        self.opt_eval_days = ctk.CTkOptionMenu(
+            bar, width=100, values=["1일", "7일", "30일", "90일"],
+            command=lambda _v: self._refresh_eval_stats())
+        self.opt_eval_days.set("7일")
+        self.opt_eval_days.pack(side="left")
+        ctk.CTkButton(bar, text="새로고침", width=90,
+                      command=self._refresh_eval_stats).pack(side="left", padx=6)
+        self.lbl_eval = ctk.CTkLabel(bar, text="", text_color=MUTED, font=("", 11))
+        self.lbl_eval.pack(side="left", padx=10)
+
+        ctk.CTkLabel(p, text="종목 × 전략 - 얼마나 자주 조건에 근접했는가", anchor="w",
+                     font=("", 12, "bold")).pack(fill="x", padx=4, pady=(6, 2))
+        self.tv_eval = self._tree(p, [
+            ("sym", "종목", 130), ("st", "전략", 120), ("n", "관측", 70),
+            ("buy", "신호", 60), ("near", "근접", 60), ("score", "평균 충족률", 100),
+            ("gap", "최소 거리", 90), ("atr", "변동성", 80),
+            ("last", "최근", 130)], 11)
+        self.tv_eval.pack(fill="both", expand=True, padx=4, pady=(0, 6))
+
+        ctk.CTkLabel(p, text="조건별 발목잡기 - 이 조건 때문에 몇 번이나 못 샀는가",
+                     anchor="w", font=("", 12, "bold")).pack(fill="x", padx=4, pady=(4, 2))
+        self.tv_eval_block = self._tree(p, [
+            ("st", "전략", 130), ("cond", "조건", 330), ("n", "관측", 80),
+            ("fail", "미충족", 80), ("pct", "미충족률", 100)], 8)
+        self.tv_eval_block.pack(fill="both", expand=True, padx=4, pady=(0, 8))
+        self.after(1500, self._refresh_eval_stats)
+
+    def _refresh_eval_stats(self) -> None:
+        days = int(self.opt_eval_days.get().replace("일", "")) if getattr(
+            self, "opt_eval_days", None) else 7
+        mode = self.core.engine.mode if self.core.engine else None
+
+        def job():
+            try:
+                stats = self.core.store.eval_stats(days, mode)
+                blocks = self.core.store.eval_block_stats(days, mode)
+            except Exception as e:
+                self.after(0, lambda: self._log(f"감시 통계 조회 실패: {e}", "error"))
+                return
+            self.after(0, lambda: self._paint_eval_stats(stats, blocks, days))
+        # 자동 갱신이라 _thread 의 '작업 중' 팝업을 띄우면 안 된다
+        threading.Thread(target=job, daemon=True).start()
+
+    def _paint_eval_stats(self, stats: list, blocks: list, days: int) -> None:
+        for i in self.tv_eval.get_children():
+            self.tv_eval.delete(i)
+        for r in stats:
+            self.tv_eval.insert("", "end", values=(
+                f"{self.core.store.stock_name(r['symbol']) or r['symbol']}",
+                r["strategy"], f"{r['n']:,}", r["buys"], r["nears"],
+                f"{(r['avg_score'] or 0) * 100:.0f}%",
+                f"{r['best_gap']:.2f}%" if r.get("best_gap") is not None else "-",
+                f"{r['atr_pct'] or 0:.2f}%", (r.get("last_ts") or "")[5:16]))
+
+        for i in self.tv_eval_block.get_children():
+            self.tv_eval_block.delete(i)
+        for b in blocks[:60]:
+            self.tv_eval_block.insert("", "end", values=(
+                b["strategy"], b["label"], f"{b['n']:,}", f"{b['fail']:,}",
+                f"{b['fail_pct']:.0f}%"))
+
+        total = sum(r["n"] for r in stats)
+        buys = sum(r["buys"] for r in stats)
+        self.lbl_eval.configure(
+            text=(f"최근 {days}일 관측 {total:,}건 · 매수신호 {buys}건 "
+                  f"· 종목x전략 조합 {len(stats)}개"
+                  if total else
+                  "아직 관측 기록이 없습니다 - 엔진을 켜두면 30초마다 쌓입니다"))
 
     def _quote_tree(self, parent) -> ttk.Treeview:
         t = self._tree(parent, self.QUOTE_COLS, 14)
@@ -657,10 +768,47 @@ class App(ctk.CTk):
     # ==================================================================
     # 전략
     # ==================================================================
+    # 영문 키만 보고 값을 정하기는 어렵다. 특히 '비율' 계열은
+    # 무엇에 대한 비율인지가 이름에 안 드러난다.
+    PARAM_LABEL = {
+        "k": "돌파계수 k",
+        "ma_filter": "추세필터 MA",
+        "vol_filter": "거래량 배수",
+        "min_range_pct": "최소 전일변동폭%",
+        "max_chase_pct": "추격 허용%",
+        "atr_stop": "손절 = ATR ×",
+        "stop_cap_atr": "손절폭 상한 = ATR ×",
+        "min_stop_atr": "손절폭 하한 = ATR ×",
+        "hard_stop_pct": "손절 절대상한 %",
+        "max_stop_pct": "(구)고정 상한 %",
+        "take_profit_r": "목표 = 손절폭 × R",
+        "take_profit_pct": "(구)고정 목표 %",
+        "trail_atr": "트레일링 = ATR ×",
+        "breakeven_pct": "본전방어 시작 %",
+        "fast": "단기 이평",
+        "slow": "장기 이평",
+        "pullback_lookback": "눌림 탐색 봉수",
+        "rsi_period": "RSI 기간",
+        "rsi_max": "진입 RSI 상한",
+        "rsi_exit": "청산 RSI",
+        "max_hold_bars": "최대 보유 봉수",
+        "range_min": "레인지 구성 분",
+        "entry_deadline": "진입 마감시각",
+        "trend_ma": "추세 이평",
+        "entry_ma": "진입 확인 이평",
+        "momentum_days": "모멘텀 기간(일)",
+        "min_momentum_pct": "최소 모멘텀 %",
+        "exit_ma": "청산 이평",
+        "max_extension_pct": "과열 제외 %",
+    }
+
     def _tab_strategy(self, p) -> None:
         ctk.CTkLabel(p, anchor="w", justify="left", wraplength=1150, text_color=MUTED,
                      text=("켜져 있는 전략이 [종목] 탭의 관심종목 전체에 대해 매수 신호를 만듭니다. "
-                           "수량과 차단은 전략이 아니라 [리스크] 탭이 결정합니다."),
+                           "수량과 차단은 전략이 아니라 [리스크] 탭이 결정합니다.\n"
+                           "손절·목표는 고정 %가 아니라 종목의 변동성(ATR) 배수로 정해집니다. "
+                           "같은 설정이라도 잘 움직이는 종목은 자동으로 폭이 넓어집니다 - "
+                           "종목별 실제 적용값은 [대시보드]의 감시 현황에서 행을 더블클릭해 확인하세요."),
                      ).pack(fill="x", padx=12, pady=(10, 6))
         sc = ctk.CTkScrollableFrame(p, fg_color="transparent")
         sc.pack(fill="both", expand=True, padx=4)
@@ -700,8 +848,9 @@ class App(ctk.CTk):
                 rw = i // 4
                 cell = ctk.CTkFrame(grid, fg_color="transparent")
                 cell.grid(row=rw, column=col, sticky="w", padx=(0, 18), pady=3)
-                ctk.CTkLabel(cell, text=k, width=130, anchor="w",
-                             text_color=MUTED, font=("", 11)).pack(side="left")
+                ctk.CTkLabel(cell, text=self.PARAM_LABEL.get(k, k), width=150,
+                             anchor="w", text_color=MUTED,
+                             font=("", 11)).pack(side="left")
                 e = ctk.CTkEntry(cell, width=80, height=28)
                 e.insert(0, str(v))
                 e.pack(side="left")
@@ -2155,8 +2304,12 @@ class App(ctk.CTk):
         pb = PaperBroker(self.core.store, self.core.quote_client,
                          self.core.cfg.cost, self.core.cfg.paper_initial_cash)
         pb.reset(self.core.cfg.paper_initial_cash)
+        # 자산 이력을 남겨두면 예전 예수금이 최고점으로 남아
+        # 새 예수금이 곧바로 '낙폭 초과'로 계산되고 엔진이 정지한다.
+        self.core.store.clear_equity("PAPER")
         self.core.rebuild()
-        self._log("PAPER 계좌 초기화 완료")
+        self._log(f"PAPER 계좌 초기화 완료 (예수금 "
+                  f"{self.core.cfg.paper_initial_cash:,}원, 자산이력 리셋)")
 
     def _save_gemini(self) -> None:
         v = self.e_gem.get().strip()
@@ -2478,6 +2631,8 @@ class App(ctk.CTk):
             if err:
                 self.lbl_risk.configure(
                     text=f"계좌 조회 실패: {err[:150]}", text_color=BAD)
+            # 감시 현황은 계좌와 무관하다. 계좌를 못 읽어도 계속 보여준다.
+            self._paint_watch()
             return
         self.cards["equity"][0].configure(text=money(eq), text_color=["gray10", "#dce4ee"])
         self.cards["equity"][1].configure(text=f"실현손익 {money(st['realized_today'])}원")
@@ -2529,6 +2684,105 @@ class App(ctk.CTk):
                 money(t.get("stop_price")), money(t.get("target_price")),
                 money(pnl), f"{pp:+.2f}%", t.get("strategy", "")))
 
+        self._paint_watch()
+
+    # ------------------------------------------------------------------
+    # 감시 현황
+    # ------------------------------------------------------------------
+    VERDICT_LABEL = {"BUY": "신호", "NEAR": "근접", "WAIT": "대기", "HELD": "보유",
+                     "NODATA": "자료부족", "ERROR": "오류"}
+
+    def _paint_watch(self) -> None:
+        e = self.core.engine
+        scan = getattr(e, "last_scan", None) or {}
+        tv = self.tv_watch_live
+        for i in tv.get_children():
+            tv.delete(i)
+
+        if not scan:
+            self.lbl_scan.configure(
+                text="아직 스캔 기록이 없습니다 - 엔진을 시작하거나 [지금 한 번 훑기]",
+                text_color=MUTED)
+            return
+
+        rows = []
+        for sym, snap in scan.items():
+            for r in snap.get("strategies", []):
+                rows.append((snap, r))
+        order = {"BUY": 0, "NEAR": 1, "HELD": 2, "WAIT": 3, "ERROR": 4, "NODATA": 5}
+        rows.sort(key=lambda x: (order.get(x[1]["verdict"], 9),
+                                 abs(x[1].get("gap_pct") or 0) if x[1].get("gap_pct")
+                                 else (1 - (x[1].get("score") or 0)) * 100))
+
+        for snap, r in rows:
+            v = r["verdict"]
+            tag = {"BUY": "buy", "NEAR": "near", "HELD": "held"}.get(v, "dim")
+            if v in ("NODATA", "ERROR"):
+                gap_s = "-"
+            elif r.get("has_gap"):
+                gap_s = f"{r['gap_pct']:+.2f}%"
+            else:
+                gap_s = "조건형"
+            lv = (f"-{r['stop_pct']:.1f}/+{r['target_pct']:.1f}%"
+                  if r.get("stop_pct") else "-")
+            q = r.get("qty") or 0
+            qty_s = f"{q}주" if q else ("0주" if r.get("size_note") else "-")
+            tv.insert("", "end", tags=("dim" if (not q and r.get("size_note")) else tag,),
+                      values=(
+                f"{snap.get('name') or snap['symbol']}",
+                money(snap.get("price")), f"{snap.get('change_pct', 0):+.2f}%",
+                f"{r.get('atr_pct') or snap.get('atr_pct', 0):.2f}%",
+                r["label"], self.VERDICT_LABEL.get(v, v),
+                f"{r['passed']}/{r['total']}" if r["total"] else "-",
+                gap_s, lv, qty_s, r.get("reason", "")[:110]))
+
+        n_buy = sum(1 for _, r in rows if r["verdict"] == "BUY")
+        n_near = sum(1 for _, r in rows if r["verdict"] == "NEAR")
+        # 신호가 떠도 0주면 못 산다. 그 사실을 미리 드러낸다.
+        n_zero = sum(1 for _, r in rows
+                     if r.get("size_note") and not r.get("qty")
+                     and r["verdict"] in ("BUY", "NEAR", "WAIT"))
+        ts = getattr(e, "last_scan_ts", None)
+        txt = (f"{len(scan)}종목 x {len(rows) // max(len(scan), 1)}전략 = {len(rows)}건 "
+               f"| 신호 {n_buy} · 근접 {n_near} "
+               f"| {ts.strftime('%H:%M:%S') if ts else '-'} 기준")
+        color = OK if n_buy else MUTED
+        if n_zero:
+            txt += (f"   ※ {n_zero}건은 신호가 나도 0주 "
+                    f"(손절폭 대비 예수금·1회손실한도 부족)")
+            color = WARN
+        self.lbl_scan.configure(text=txt, text_color=color)
+
+    def _scan_once(self) -> None:
+        """엔진이 꺼져 있어도 지금 한 번 훑어본다."""
+        def job():
+            try:
+                self.core.engine.scan()
+            except Exception as ex:
+                self._log(f"스캔 실패: {ex}", "error")
+            self.after(0, self._paint_watch)
+            self._scanning = False
+        if getattr(self, "_scanning", False):
+            return
+        self._scanning = True
+        self._log("감시 스캔 수동 실행")
+        threading.Thread(target=job, daemon=True).start()
+
+    def _open_watch_detail(self) -> None:
+        sel = self.tv_watch_live.selection()
+        if not sel:
+            return
+        vals = self.tv_watch_live.item(sel[0], "values")
+        name, label = vals[0], vals[4]
+        scan = getattr(self.core.engine, "last_scan", None) or {}
+        for sym, snap in scan.items():
+            if (snap.get("name") or sym) != name:
+                continue
+            for r in snap.get("strategies", []):
+                if r["label"] == label:
+                    WatchDetailDialog(self, snap, r)
+                    return
+
     def _quit(self) -> None:
         if self.core.lab and self.core.lab.running_names():
             if not messagebox.askyesno(
@@ -2541,6 +2795,89 @@ class App(ctk.CTk):
                 return
             self.core.engine.stop()
         self.destroy()
+
+
+class WatchDetailDialog(ctk.CTkToplevel):
+    """한 종목 x 한 전략이 지금 어떤 상태인지 조건별로 펼쳐 보여준다."""
+
+    def __init__(self, app, snap: dict, r: dict):
+        super().__init__(app)
+        self.app = app
+        sym = snap["symbol"]
+        name = snap.get("name") or sym
+        self.title(f"{name} - {r['label']}")
+        self.geometry("760x620")
+        self.transient(app)
+
+        ctk.CTkLabel(self, text=f"{name} ({sym})  ·  {r['label']}", anchor="w",
+                     font=("", 16, "bold")).pack(fill="x", padx=16, pady=(14, 2))
+
+        head = (f"현재가 {money(snap.get('price'))}원  "
+                f"({snap.get('change_pct', 0):+.2f}%)   |   "
+                f"변동성 ATR {r.get('atr_pct', 0):.2f}%   |   "
+                f"판정 {App.VERDICT_LABEL.get(r['verdict'], r['verdict'])} "
+                f"({r['passed']}/{r['total']} 조건 충족)")
+        ctk.CTkLabel(self, text=head, anchor="w", text_color=MUTED,
+                     font=("", 12)).pack(fill="x", padx=16, pady=(0, 8))
+
+        lv = ctk.CTkFrame(self, fg_color=CARD, corner_radius=8)
+        lv.pack(fill="x", padx=14, pady=(0, 8))
+        ctk.CTkLabel(lv, text="이 종목에 지금 적용되는 값 (변동성에 맞춰 자동 환산)",
+                     anchor="w", font=("", 12, "bold")).pack(fill="x", padx=12, pady=(10, 2))
+        if r.get("stop_pct"):
+            lv_txt = (f"손절폭 -{r['stop_pct']:.2f}%   ·   "
+                      f"목표폭 +{r.get('target_pct', 0):.2f}%   ·   "
+                      f"손익비 {(r.get('target_pct') or 0) / r['stop_pct']:.2f}R")
+        else:
+            lv_txt = "손절폭 산출 불가"
+        ctk.CTkLabel(lv, anchor="w", justify="left", text_color=MUTED, font=("", 11),
+                     text=lv_txt).pack(fill="x", padx=12, pady=(0, 4))
+        if r.get("size_note"):
+            ctk.CTkLabel(lv, anchor="w", justify="left", font=("", 11),
+                         text_color=OK if r.get("qty") else BAD,
+                         text=f"지금 신호가 나면: {r['size_note']}",
+                         wraplength=700).pack(fill="x", padx=12, pady=(0, 10))
+        else:
+            ctk.CTkLabel(lv, text="", height=4).pack()
+
+        ctk.CTkLabel(self, text="진입 조건 판정", anchor="w",
+                     font=("", 13, "bold")).pack(fill="x", padx=16, pady=(4, 4))
+        box = ctk.CTkScrollableFrame(self, fg_color=CARD, corner_radius=8, height=230)
+        box.pack(fill="both", expand=True, padx=14, pady=(0, 8))
+        for c in (r.get("checks") or []):
+            row = ctk.CTkFrame(box, fg_color="transparent")
+            row.pack(fill="x", pady=3)
+            ok = bool(c.get("ok"))
+            ctk.CTkLabel(row, text="●", width=18,
+                         text_color=OK if ok else BAD).pack(side="left")
+            ctk.CTkLabel(row, text=c.get("label", ""), width=300, anchor="w",
+                         font=("", 12)).pack(side="left")
+            ctk.CTkLabel(row, text=c.get("detail", ""), anchor="w", text_color=MUTED,
+                         font=("", 11)).pack(side="left", padx=8)
+        if not r.get("checks"):
+            ctk.CTkLabel(box, text=r.get("reason") or "판정 항목 없음",
+                         text_color=MUTED).pack(pady=10)
+
+        ctk.CTkLabel(self, text="최근 관측 기록", anchor="w",
+                     font=("", 13, "bold")).pack(fill="x", padx=16, pady=(4, 4))
+        tv = App._tree(self, [("ts", "시각", 140), ("vd", "판정", 70),
+                              ("cond", "조건", 70), ("gap", "트리거까지", 100),
+                              ("px", "가격", 100), ("why", "차단", 220)], 7)
+        tv.pack(fill="both", expand=True, padx=14, pady=(0, 6))
+        try:
+            for e in app.core.store.recent_evals(limit=60, symbol=sym):
+                if e.get("strategy") != r["strategy"]:
+                    continue
+                tv.insert("", "end", values=(
+                    (e.get("ts") or "")[5:], App.VERDICT_LABEL.get(e.get("verdict"), ""),
+                    f"{e.get('passed')}/{e.get('total')}",
+                    f"{e.get('gap_pct') or 0:+.2f}%", money(e.get("price")),
+                    (e.get("blocked_by") or "")[:60]))
+        except Exception as ex:
+            tv.insert("", "end", values=("기록 조회 실패", str(ex)[:40], "", "", "", ""))
+
+        ctk.CTkButton(self, text="닫기", width=100,
+                      command=self.destroy).pack(pady=(0, 12))
 
 
 class ScanDialog(ctk.CTkToplevel):

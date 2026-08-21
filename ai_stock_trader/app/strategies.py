@@ -24,6 +24,21 @@ class Signal:
 
 
 @dataclass
+class Check:
+    """진입 조건 하나에 대한 판정.
+
+    엔진은 매 루프마다 전 종목에 대해 이걸 만들어 저장한다.
+    "왜 안 샀는가"가 쌓여야 전략을 고칠 근거가 생긴다.
+    """
+    label: str
+    ok: bool
+    detail: str = ""
+
+    def to_dict(self) -> dict:
+        return {"label": self.label, "ok": bool(self.ok), "detail": self.detail}
+
+
+@dataclass
 class Position:
     symbol: str
     entry_price: float
@@ -75,6 +90,84 @@ class Strategy:
             new_stop = max(new_stop, pos.entry_price * 1.001)
         return max(pos.stop, new_stop)
 
+    # -- 진단 --------------------------------------------------------------
+    def checklist(self, hist: list[dict], price: float, ctx: dict) -> list[Check]:
+        """진입 조건을 항목별로 풀어서 보여준다. 매매 판단에는 쓰지 않는다.
+
+        판단의 근거는 어디까지나 entry() 하나다 (백테스트와 같은 경로).
+        여기는 사람이 읽기 위한 계기판이다.
+        """
+        return []
+
+    def entry_gap_pct(self, hist: list[dict], price: float, ctx: dict) -> float | None:
+        """진입 트리거까지 남은 거리 (%). 음수면 이미 넘어섰다는 뜻.
+
+        돌파형 전략만 의미가 있다. 조건형 전략은 None.
+        """
+        t = self.trigger_price(hist, float(ctx.get("today_open") or 0))
+        if t is None or price <= 0:
+            return None
+        return (t - price) / price * 100
+
+    # -- 종목별 비율 스케일 --------------------------------------------------
+    def vol_pct(self, hist: list[dict], price: float) -> float:
+        """이 종목의 변동성 척도 (가격 대비 %).
+
+        같은 '손절 2.5%'라도 하루 1% 움직이는 종목과 5% 움직이는 종목에서
+        의미가 전혀 다르다. 종목마다 다른 기준을 만들려면 먼저 이 값이 필요하다.
+        """
+        if price <= 0 or not hist:
+            return 0.0
+        a = ind.last(ind.atr(hist, 14))
+        return (a / price * 100) if a else 0.0
+
+    def levels(self, price: float, hist: list[dict], base_stop: float) -> tuple[float, float]:
+        """손절가와 목표가를 종목의 변동성에 맞춰 정한다.
+
+        고정 %로 정하면 종목마다 의미가 달라진다. 하루 8% 움직이는 장에서
+        '손절 2.5%'는 손절이 아니라 진입 직후 강제퇴장에 가깝다.
+        그래서 기준을 ATR 배수로 두고, 절대 상한은 안전벨트로만 남긴다.
+
+        - stop_cap_atr : 손절폭 상한 = ATR 의 몇 배 (0 이면 아래 고정 % 사용)
+        - hard_stop_pct: 변동성이 아무리 커도 넘지 않을 절대 상한 (%)
+        - max_stop_pct : stop_cap_atr 이 0 일 때만 쓰이는 예전 방식 고정 상한
+        - take_profit_r: 목표 = 손절폭의 몇 배(R). 종목이 달라도 손익비는 같다.
+        """
+        stop = base_stop
+        v = self.vol_pct(hist, price)
+
+        # 너무 좁은 손절은 손절이 아니라 노이즈에 털리는 장치다.
+        # 왕복 비용(0.2%)조차 못 덮는 폭이면 이길 수가 없다.
+        floor = float(self.p.get("min_stop_atr", 0) or 0)
+        if floor > 0 and v > 0:
+            stop = min(stop, price * (1 - floor * v / 100))
+
+        cap = float(self.p.get("stop_cap_atr", 0) or 0)
+        if cap > 0 and v > 0:
+            stop = max(stop, price * (1 - cap * v / 100))
+            hard = float(self.p.get("hard_stop_pct", 0) or 0)
+            if hard > 0:
+                stop = max(stop, price * (1 - hard / 100))
+        else:
+            stop = self._clamp_stop(price, stop)
+
+        r = float(self.p.get("take_profit_r", 0) or 0)
+        if r > 0 and 0 < stop < price:
+            return stop, price + r * (price - stop)
+        tp = float(self.p.get("take_profit_pct", 0) or 0)
+        return stop, (price * (1 + tp / 100) if tp > 0 else 0.0)
+
+    def effective_pcts(self, hist: list[dict], price: float) -> dict:
+        """이 종목에 지금 적용되는 실제 손절/목표 폭(%)."""
+        v = self.vol_pct(hist, price)
+        a = ind.last(ind.atr(hist, 14)) or (price * v / 100)
+        stop, target = self.levels(price, hist, price - float(self.p.get("atr_stop", 2) or 2) * (a or 0))
+        return {
+            "atr_pct": v,
+            "stop_pct": ((price - stop) / price * 100) if price > 0 and stop > 0 else 0.0,
+            "target_pct": ((target - price) / price * 100) if price > 0 and target > 0 else 0.0,
+        }
+
     def _clamp_stop(self, price: float, stop: float) -> float:
         """손절폭을 진입가 대비 일정 % 이내로 제한한다.
 
@@ -109,10 +202,15 @@ class VolatilityBreakout(Strategy):
         "vol_filter": 1.0,        # 전일 거래량 / 20일 평균 >= 이 값
         "atr_stop": 2.0,          # 손절폭 = ATR * 이 값
         "max_stop_pct": 2.5,      # 단, 손절폭은 진입가의 이 % 이내 (당일청산이라 좁게)
-        "take_profit_pct": 4.0,   # 익절 (%)
+        "take_profit_pct": 4.0,   # 익절 (%) - take_profit_r 이 0일 때만 쓰임
+        "take_profit_r": 1.6,     # 목표 = 손절폭의 몇 배 (종목이 달라도 손익비는 동일)
+        "stop_cap_atr": 1.2,      # 손절폭 상한을 ATR 의 몇 배로 (종목별 자동 환산)
+        "hard_stop_pct": 12.0,    # 변동성이 아무리 커도 넘지 않을 절대 상한 (%)
+                                  # 평소엔 안 걸린다. 이상치 방어용이다.
         "trail_atr": 0.0,
         "breakeven_pct": 1.5,
         "min_range_pct": 0.8,     # 전일 변동폭이 너무 작으면 스킵 (%)
+        "max_chase_pct": 1.5,     # 트리거 대비 이만큼 넘게 뛴 뒤에는 추격 금지 (%)
     }
 
     def trigger_price(self, hist: list[dict], today_open: float) -> float | None:
@@ -151,12 +249,47 @@ class VolatilityBreakout(Strategy):
             return Signal("HOLD", 0, f"돌파는 했으나 목표가({t:,.0f}) 대비 과열 - 추격 금지")
 
         a = ind.last(ind.atr(hist, 14)) or (price * 0.02)
-        stop = self._clamp_stop(price, price - float(self.p["atr_stop"]) * a)
-        target = price * (1 + float(self.p["take_profit_pct"]) / 100)
+        stop, target = self.levels(price, hist, price - float(self.p["atr_stop"]) * a)
         rng = float(hist[-1]["high"]) - float(hist[-1]["low"])
         return Signal("BUY", 1.0,
                       f"변동성돌파 진입: 목표가 {t:,.0f} 돌파 (전일변동폭 {rng:,.0f} x k={self.p['k']})",
                       stop=stop, target=target)
+
+    def checklist(self, hist: list[dict], price: float, ctx: dict) -> list[Check]:
+        if not self._ok(hist):
+            return [Check("일봉 데이터", False, f"{len(hist)}/{self.warmup}봉")]
+        prev = hist[-1]
+        out: list[Check] = []
+
+        rng = float(prev["high"]) - float(prev["low"])
+        rp = rng / float(prev["close"]) * 100 if prev["close"] else 0
+        need = float(self.p["min_range_pct"])
+        out.append(Check(f"전일 변동폭 >= {need}%", rp >= need, f"{rp:.2f}%"))
+
+        ma = int(self.p.get("ma_filter") or 0)
+        if ma > 0:
+            m = ind.last(ind.sma(ind.closes(hist), ma))
+            out.append(Check(f"전일종가 > MA{ma}", bool(m and float(prev["close"]) >= m),
+                             f"{float(prev['close']):,.0f} vs {m:,.0f}" if m else "-"))
+
+        vf = float(self.p.get("vol_filter") or 0)
+        if vf > 0:
+            vavg = ind.last(ind.sma(ind.volumes(hist), 20))
+            v = float(prev.get("volume") or 0)
+            out.append(Check(f"거래량 >= 20일평균 x{vf}", bool(vavg and v >= vavg * vf),
+                             f"{v / vavg:.2f}배" if vavg else "-"))
+
+        t = self.trigger_price(hist, float(ctx.get("today_open") or 0))
+        if t is None:
+            out.append(Check("돌파 목표가 돌파", False, "목표가 산출 불가 (필터 미통과)"))
+        else:
+            gap = (t - price) / price * 100 if price else 0
+            out.append(Check("돌파 목표가 돌파", price >= t,
+                             f"목표 {t:,.0f} / 현재 {price:,.0f} ({gap:+.2f}%)"))
+            chase = float(self.p.get("max_chase_pct", 1.5))
+            out.append(Check(f"추격 한도 {chase}% 이내", price <= t * (1 + chase / 100),
+                             f"{(price / t - 1) * 100:+.2f}%" if t else "-"))
+        return out
 
     def exit(self, hist: list[dict], price: float, pos: Position, ctx: dict) -> Signal:
         if price <= pos.stop:
@@ -185,6 +318,9 @@ class TrendPullback(Strategy):
         "rsi_max": 65,            # 이미 과열이면 진입 금지
         "rsi_exit": 72,
         "atr_stop": 2.0, "max_stop_pct": 8.0, "take_profit_pct": 6.0,
+        "take_profit_r": 2.0,     # 목표 = 손절폭의 몇 배
+        "stop_cap_atr": 3.0,      # 손절폭 상한 = ATR 의 몇 배
+        "hard_stop_pct": 20.0,    # 절대 상한 (%) - 이상치 방어용
         "trail_atr": 2.5, "breakeven_pct": 2.0,
         "max_hold_bars": 15,
     }
@@ -225,12 +361,40 @@ class TrendPullback(Strategy):
             return HOLD
 
         a = ind.last(ind.atr(hist, 14)) or (price * 0.02)
-        stop = self._clamp_stop(price, price - float(self.p["atr_stop"]) * a)
-        target = price * (1 + float(self.p["take_profit_pct"]) / 100)
+        stop, target = self.levels(price, hist, price - float(self.p["atr_stop"]) * a)
         return Signal("BUY", 1.0,
                       f"정배열 눌림목: MA{fast}>{slow} 유지, 최근 {n}봉 내 MA{fast} 터치 후 "
                       f"반등 (RSI {r[-1]:.1f})",
                       stop=stop, target=target)
+
+    def checklist(self, hist: list[dict], price: float, ctx: dict) -> list[Check]:
+        if not self._ok(hist):
+            return [Check("일봉 데이터", False, f"{len(hist)}/{self.warmup}봉")]
+        cs, ls = ind.closes(hist), ind.lows(hist)
+        fast, slow = int(self.p["fast"]), int(self.p["slow"])
+        f = ind.sma(cs, fast)
+        sm = ind.sma(cs, slow)
+        r = ind.rsi(cs, int(self.p["rsi_period"]))
+        if f[-1] is None or sm[-1] is None or r[-1] is None:
+            return [Check("지표 계산", False, "이평/RSI 산출 불가")]
+
+        out = [Check(f"정배열 (MA{fast}>MA{slow})", f[-1] > sm[-1],
+                     f"{f[-1]:,.0f} vs {sm[-1]:,.0f}"),
+               Check(f"종가 > MA{slow}", cs[-1] > sm[-1],
+                     f"{cs[-1]:,.0f} vs {sm[-1]:,.0f}"),
+               Check(f"MA{slow} 우상향", bool(sm[-6] is not None and sm[-1] > sm[-6]),
+                     f"{(sm[-1] / sm[-6] - 1) * 100:+.2f}% (5봉)" if sm[-6] else "-")]
+
+        n = int(self.p["pullback_lookback"])
+        touched = any(ls[i] <= f[i] for i in range(max(len(hist) - n, 0), len(hist))
+                      if f[i] is not None)
+        out.append(Check(f"최근 {n}봉 내 MA{fast} 터치", touched,
+                         f"현재가 MA{fast} 대비 {(cs[-1] / f[-1] - 1) * 100:+.2f}%"))
+        out.append(Check(f"MA{fast} 위로 반등", cs[-1] > f[-1] and cs[-1] > cs[-2],
+                         f"전일대비 {(cs[-1] / cs[-2] - 1) * 100:+.2f}%"))
+        rmax = float(self.p["rsi_max"])
+        out.append(Check(f"RSI < {rmax}", r[-1] < rmax, f"RSI {r[-1]:.1f}"))
+        return out
 
     def exit(self, hist: list[dict], price: float, pos: Position, ctx: dict) -> Signal:
         if price <= pos.stop:
@@ -269,11 +433,22 @@ class OpeningRangeBreakout(Strategy):
         "atr_stop": 1.5,
         "max_stop_pct": 1.5,
         "take_profit_pct": 2.0,
+        "take_profit_r": 1.5,     # 목표 = 손절폭의 몇 배
+        "stop_cap_atr": 0.8,      # 손절폭 상한 = 오늘 시가레인지 폭의 몇 배
+        "min_stop_atr": 0.35,     # 손절폭 하한 = 레인지 폭의 몇 배 (노이즈 방어)
+        "hard_stop_pct": 6.0,     # 절대 상한 (%) - 이상치 방어용
         "trail_atr": 2.0,
         "breakeven_pct": 1.0,
         "max_chase_pct": 0.4,
         "entry_deadline": "13:30",  # 이 시각 이후에는 신규 진입 안 함
     }
+
+    def vol_pct(self, hist: list[dict], price: float) -> float:
+        """1분봉 ATR 은 너무 작아서 기준이 못 된다. 오늘 시가레인지 폭을 쓴다."""
+        rg = self._range(hist)
+        if not rg or price <= 0:
+            return 0.0
+        return (rg[0] - rg[1]) / price * 100
 
     def _range(self, hist: list[dict]) -> tuple[float, float] | None:
         """오늘 09:00부터 range_min 분간의 고가/저가."""
@@ -306,11 +481,54 @@ class OpeningRangeBreakout(Strategy):
             return Signal("HOLD", 0, f"레인지 고가({hi:,.0f}) 돌파 후 과열 - 추격 금지")
 
         a = ind.last(ind.atr(hist, 14)) or (price * 0.005)
-        stop = self._clamp_stop(price, max(lo, price - float(self.p["atr_stop"]) * a))
-        target = price * (1 + float(self.p["take_profit_pct"]) / 100)
+        stop, target = self.levels(price, hist,
+                                   max(lo, price - float(self.p["atr_stop"]) * a))
         return Signal("BUY", 1.0,
                       f"시가레인지({self.p['range_min']}분) 고가 {hi:,.0f} 상향돌파",
                       stop=stop, target=target)
+
+    def checklist(self, hist: list[dict], price: float, ctx: dict) -> list[Check]:
+        if len(hist) < self.warmup:
+            return [Check("분봉 데이터", False, f"{len(hist)}/{self.warmup}봉")]
+        now = str(ctx.get("now_hhmm") or hist[-1]["ts"][11:16])
+        dl = str(self.p["entry_deadline"])
+        out = [Check(f"진입 마감 {dl} 이전", now < dl, f"현재 {now}")]
+
+        rg = self._range(hist)
+        if not rg:
+            out.append(Check(f"시가 {self.p['range_min']}분 레인지 형성", False,
+                             "오늘 분봉 부족"))
+            return out
+        hi, lo = rg
+        out.append(Check(f"시가 {self.p['range_min']}분 레인지 형성", True,
+                         f"{lo:,.0f} ~ {hi:,.0f} (폭 {(hi - lo) / price * 100:.2f}%)"))
+        gap = (hi - price) / price * 100 if price else 0
+        out.append(Check("레인지 고가 돌파", price >= hi,
+                         f"고가 {hi:,.0f} / 현재 {price:,.0f} ({gap:+.2f}%)"))
+        chase = float(self.p["max_chase_pct"])
+        out.append(Check(f"추격 한도 {chase}% 이내", price <= hi * (1 + chase / 100),
+                         f"{(price / hi - 1) * 100:+.2f}%"))
+        return out
+
+    def entry_gap_pct(self, hist: list[dict], price: float, ctx: dict) -> float | None:
+        rg = self._range(hist)
+        if not rg or price <= 0:
+            return None
+        return (rg[0] - price) / price * 100
+
+    def effective_pcts(self, hist: list[dict], price: float) -> dict:
+        """이 전략의 손절은 레인지 저가가 기준이다. 표시값도 거기 맞춘다."""
+        rg = self._range(hist)
+        a = ind.last(ind.atr(hist, 14)) or (price * 0.005)
+        base = price - float(self.p["atr_stop"]) * a
+        if rg:
+            base = max(rg[1], base)
+        stop, target = self.levels(price, hist, base)
+        return {
+            "atr_pct": self.vol_pct(hist, price),
+            "stop_pct": ((price - stop) / price * 100) if price > 0 and stop > 0 else 0.0,
+            "target_pct": ((target - price) / price * 100) if price > 0 and target > 0 else 0.0,
+        }
 
     def exit(self, hist: list[dict], price: float, pos: Position, ctx: dict) -> Signal:
         if price <= pos.stop:
@@ -346,6 +564,9 @@ class LongTermTrend(Strategy):
         "trail_atr": 2.5,
         "breakeven_pct": 15.0,    # 15% 이상 오르면 본전 방어
         "take_profit_pct": 0.0,   # 0 = 익절 안 함 (추세가 끝날 때까지 보유)
+        "take_profit_r": 0.0,     # 장투는 목표를 두지 않는다 (트레일링으로만 따라감)
+        "stop_cap_atr": 4.0,      # 손절폭 상한 = ATR 의 몇 배
+        "hard_stop_pct": 40.0,    # 절대 상한 (%) - 이상치 방어용
         "exit_ma": 200,           # 이 이평 이탈 시 청산
         "max_extension_pct": 25.0,  # 장기이평 대비 이만큼 위면 과열 - 신규진입 안 함
     }
@@ -385,15 +606,44 @@ class LongTermTrend(Strategy):
                           f"장기이평 대비 {ext:.1f}% 과열 - 눌림 기다림")
 
         a = ind.last(ind.atr(hist, 14)) or (price * 0.02)
-        stop = self._clamp_stop(price, price - float(self.p["atr_stop"]) * a)
+        stop, target = self.levels(price, hist, price - float(self.p["atr_stop"]) * a)
         # 장기이평 아래로는 어차피 청산하므로 손절을 그보다 낮게 둘 이유가 없다
         stop = max(stop, tma[-1] * 0.97)
-        tp = float(self.p["take_profit_pct"])
-        target = price * (1 + tp / 100) if tp > 0 else 0.0
         return Signal("BUY", 1.0,
                       f"장기추세 진입: {int(self.p['trend_ma'])}일선 위 "
                       f"(+{ext:.1f}%), {n}일 모멘텀 {mom:+.1f}%",
                       stop=stop, target=target)
+
+    def checklist(self, hist: list[dict], price: float, ctx: dict) -> list[Check]:
+        if not self._ok(hist):
+            return [Check("일봉 데이터", False, f"{len(hist)}/{self.warmup}봉")]
+        cs = ind.closes(hist)
+        tw, ew = int(self.p["trend_ma"]), int(self.p["entry_ma"])
+        tma, ema_ = ind.sma(cs, tw), ind.sma(cs, ew)
+        if tma[-1] is None or ema_[-1] is None:
+            return [Check("지표 계산", False, "이평 산출 불가")]
+
+        look = min(20, len(tma) - 1)
+        ext = (cs[-1] / tma[-1] - 1) * 100
+        out = [Check(f"종가 > MA{tw}", cs[-1] > tma[-1], f"{ext:+.1f}%"),
+               Check(f"MA{tw} 우상향",
+                     bool(tma[-1 - look] and tma[-1] > tma[-1 - look]),
+                     f"{(tma[-1] / tma[-1 - look] - 1) * 100:+.2f}% ({look}봉)"
+                     if tma[-1 - look] else "-"),
+               Check(f"MA{ew} > MA{tw}", ema_[-1] > tma[-1],
+                     f"{ema_[-1]:,.0f} vs {tma[-1]:,.0f}")]
+
+        n = int(self.p["momentum_days"])
+        if len(cs) > n:
+            mom = (cs[-1] / cs[-1 - n] - 1) * 100
+            out.append(Check(f"{n}일 모멘텀 >= {self.p['min_momentum_pct']}%",
+                             mom >= float(self.p["min_momentum_pct"]), f"{mom:+.1f}%"))
+        else:
+            out.append(Check(f"{n}일 모멘텀", False, "기간 부족"))
+
+        mx = float(self.p["max_extension_pct"])
+        out.append(Check(f"MA{tw} 대비 과열 아님 (<{mx}%)", ext <= mx, f"{ext:+.1f}%"))
+        return out
 
     def exit(self, hist: list[dict], price: float, pos: Position, ctx: dict) -> Signal:
         if pos.stop > 0 and price <= pos.stop:

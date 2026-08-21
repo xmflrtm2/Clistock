@@ -4,8 +4,12 @@
     1. 장이 열려 있나 확인
     2. 계좌 동기화 -> 리스크 상태 갱신 (일일손실/낙폭/쿨다운)
     3. 보유 포지션 청산 조건 확인 -> 매도
-    4. 관심종목 진입 조건 확인 -> 리스크 관문 통과 시 매수
-    5. 자산곡선 기록
+    4. 관심종목 전체를 전략별로 평가 (감시 스캔) -> 결과를 DB에 축적
+    5. 그중 매수 신호가 난 종목만 리스크 관문에 태워 매수
+    6. 자산곡선 기록
+
+    4번은 리스크로 진입이 막혀 있어도 항상 돈다.
+    "왜 안 샀는지"가 남아야 전략을 고칠 수 있기 때문이다.
 
 엔진이 관리하는 포지션은 "엔진이 연 것"뿐이다.
 사용자가 직접 산 종목은 건드리지 않는다 (원하면 GUI에서 편입할 수 있다).
@@ -23,7 +27,7 @@ from .market import MarketCalendar, hhmm
 from .risk import RiskManager
 from .settings import AppConfig
 from .storage import Store
-from .strategies import Position, Strategy, build
+from .strategies import Check, Position, Strategy, build
 
 log = logging.getLogger(__name__)
 
@@ -62,6 +66,11 @@ class TradingEngine:
         self.account_ts: datetime | None = None
         self.account_error = ""
         self._filled_this_tick = 0
+        # 감시 스캔 - 진입이 막혀 있어도 계속 도는 관측 루프
+        self.last_scan: dict[str, dict] = {}
+        self.last_scan_ts: datetime | None = None
+        self._eval_mark: dict[tuple, tuple] = {}
+        self._last_block_msg = ("", 0.0)
 
     # -- 이벤트 -------------------------------------------------------------
     def emit(self, kind: str, msg: str, data: dict | None = None) -> None:
@@ -168,7 +177,7 @@ class TradingEngine:
 
         ok, why = self.risk.check_global(equity)
         if not ok:
-            self.emit("risk", f"신규진입 차단: {why}")
+            self._block_note(why)
 
         # 2) 강제 청산 시각
         fx = (self.cfg.execution.force_exit_at or "").strip()
@@ -192,26 +201,33 @@ class TradingEngine:
             except Exception as e:
                 self.emit("error", f"{t['symbol']} 관리 실패: {e}")
 
-        # 4) 신규 진입
-        if not ok:
-            return
+        # 4) 감시 스캔 - 진입이 막혀 있어도 항상 돈다.
+        #    막혔다고 안 보면 "왜 안 샀는지"에 대한 기록이 영영 남지 않는다.
         in_window = (hhmm(self.cfg.execution.entry_start) <= now.time()
                      <= hhmm(self.cfg.execution.entry_end))
-        if not in_window:
+        snaps = self.scan(held, blocked="" if ok else why, acct=acct)
+
+        # 5) 신규 진입 - 스캔에서 이미 BUY 가 난 종목만 대상
+        if not ok or not in_window:
             return
         for symbol in self.cfg.watchlist:
             if self._stop.is_set():
                 break
             if symbol in held:
                 continue
+            snap = snaps.get(symbol) or {}
+            hit = next((r for r in snap.get("strategies", [])
+                        if r.get("verdict") == "BUY"), None)
+            if not hit:
+                continue
             try:
-                self._try_entry(symbol, acct, len(held))
+                self._enter(symbol, snap, hit, acct, len(held))
                 if self.store.get_open_trade(symbol, self.mode):
                     held.add(symbol)
             except Exception as e:
                 self.emit("error", f"{symbol} 진입 검토 실패: {e}")
 
-        # 5) 체결이 있었으면 계좌를 다시 읽는다.
+        # 6) 체결이 있었으면 계좌를 다시 읽는다.
         #    안 그러면 대시보드가 매수 직전 금액에 머물러 "금액이 안 변한다"로 보인다.
         if self._filled_this_tick:
             self._settle_account()
@@ -377,98 +393,271 @@ class TradingEngine:
                 amt += float(h.get("eval_amt") or 0)
         return amt / equity * 100
 
-    # -- 진입 ---------------------------------------------------------------
-    def _try_entry(self, symbol: str, acct: dict, open_count: int) -> None:
-        equity = float(acct["total_eval"] or 0)
-        cash = float(acct["orderable_cash"] or acct["cash"] or 0)
+    # -- 감시 스캔 ----------------------------------------------------------
+    def scan(self, held: set[str] | None = None, blocked: str = "",
+             acct: dict | None = None) -> dict[str, dict]:
+        """관심종목 전체를 전략별로 평가한다.
 
+        매수 여부와 무관하게 항상 돈다. 여기서 나온 것이
+        화면의 '감시 현황'이고, DB(watch_eval)에 쌓이는 관측 데이터다.
+        """
+        if held is None:
+            held = {t["symbol"] for t in self.store.open_trades(self.mode)}
+        if acct is None:
+            acct = self.account or {}
+        equity = float(acct.get("total_eval") or 0)
+        cash = float(acct.get("orderable_cash") or acct.get("cash") or 0)
+        now = datetime.now()
+        out: dict[str, dict] = {}
+        rows: list[dict] = []
+        buys: list[str] = []
+        nears: list[str] = []
+
+        for symbol in self.cfg.watchlist:
+            if self._stop.is_set():
+                break
+            try:
+                snap = self._evaluate(symbol, now, held, blocked, equity, cash)
+            except Exception as e:
+                snap = {"symbol": symbol, "ts": now.strftime("%H:%M:%S"),
+                        "price": 0.0, "change_pct": 0.0, "atr_pct": 0.0,
+                        "error": str(e)[:100], "strategies": []}
+            out[symbol] = snap
+            for r in snap.get("strategies", []):
+                if r["verdict"] == "BUY":
+                    buys.append(f"{symbol}/{r['label']}")
+                elif r["verdict"] == "NEAR":
+                    nears.append(f"{symbol}/{r['label']} {r['gap_pct']:+.2f}%")
+                if self._should_record(symbol, r, now):
+                    rows.append({
+                        "ts": now.strftime("%Y-%m-%d %H:%M:%S"), "mode": self.mode,
+                        "symbol": symbol, "strategy": r["strategy"],
+                        "verdict": r["verdict"], "score": r["score"],
+                        "gap_pct": r["gap_pct"], "price": snap.get("price") or 0,
+                        "atr_pct": r.get("atr_pct") or 0,
+                        "change_pct": snap.get("change_pct") or 0,
+                        "passed": r["passed"], "total": r["total"],
+                        "detail": r["checks"], "blocked_by": blocked,
+                    })
+
+        self.last_scan = out
+        self.last_scan_ts = now
+        if rows:
+            try:
+                self.store.add_evals(rows)
+            except Exception as e:
+                log.debug("스캔 기록 실패: %s", e)
+
+        msg = (f"감시 {len(out)}종목 x 전략 {len(self.strategies)}개 평가 - "
+               f"신호 {len(buys)} / 근접 {len(nears)}")
+        if buys:
+            msg += f" | 신호: {', '.join(buys[:4])}"
+        elif nears:
+            msg += f" | 가장 가까움: {', '.join(nears[:3])}"
+        self.emit("scan", msg, {"buys": buys, "nears": nears})
+        return out
+
+    def _evaluate(self, symbol: str, now: datetime, held: set[str],
+                  blocked: str, equity: float = 0, cash: float = 0) -> dict:
+        """한 종목을 모든 전략으로 평가한 스냅샷."""
         q = self.broker.quote(symbol)
         price = float(q["price"])
-        if price <= 0:
-            return
-        self.store.add_quote(symbol, price, q.get("change_pct", 0), q.get("volume", 0))
-
+        if price > 0:
+            self.store.add_quote(symbol, price, q.get("change_pct", 0), q.get("volume", 0))
         sector = (q.get("sector") or "").strip()
         if sector:
             self.store.set_sector(symbol, sector)
 
-        if q.get("halt") == "Y":
+        snap = {
+            "symbol": symbol,
+            "name": self._name(symbol),
+            "ts": now.strftime("%H:%M:%S"),
+            "price": price,
+            "change_pct": float(q.get("change_pct") or 0),
+            "volume": float(q.get("volume") or 0),
+            "sector": sector,
+            "held": symbol in held,
+            "halt": q.get("halt") == "Y",
+            "warn": str(q.get("market_warn", "00")) not in ("00", ""),
+            "blocked": blocked,
+            "atr_pct": 0.0,
+            "strategies": [],
+        }
+        ctx = {"today_open": float(q.get("open") or price),
+               "now_hhmm": now.strftime("%H:%M")}
+
+        for strat in self.strategies:
+            r = {"strategy": strat.name, "label": strat.label, "verdict": "WAIT",
+                 "score": 0.0, "gap_pct": 0.0, "passed": 0, "total": 0,
+                 "checks": [], "reason": "", "atr_pct": 0.0,
+                 "stop_pct": 0.0, "target_pct": 0.0, "has_gap": False,
+                 "qty": 0, "size_note": ""}
+            hist = self._hist(symbol, strat.timeframe)
+            if len(hist) < strat.warmup:
+                r["verdict"] = "NODATA"
+                r["reason"] = f"{strat.timeframe} {len(hist)}/{strat.warmup}봉 - 데이터 부족"
+                snap["strategies"].append(r)
+                continue
+
+            try:
+                checks = strat.checklist(hist, price, ctx)
+                r["checks"] = [c.to_dict() for c in checks]
+                r["total"] = len(checks)
+                r["passed"] = sum(1 for c in checks if c.ok)
+                r["score"] = (r["passed"] / r["total"]) if r["total"] else 0.0
+                gap = strat.entry_gap_pct(hist, price, ctx)
+                r["has_gap"] = gap is not None
+                r["gap_pct"] = float(gap) if gap is not None else 0.0
+                eff = strat.effective_pcts(hist, price)
+                r["atr_pct"] = eff["atr_pct"]
+                r["stop_pct"] = eff["stop_pct"]
+                r["target_pct"] = eff["target_pct"]
+                snap["atr_pct"] = max(snap["atr_pct"], eff["atr_pct"])
+
+                # 지금 신호가 나면 실제로 몇 주나 살 수 있는가.
+                # 손절폭이 넓어질수록 수량은 줄어든다. 0주면 신호가 나도 못 산다 -
+                # 그 사실을 신호가 난 뒤가 아니라 미리 보여준다.
+                if equity > 0 and eff["stop_pct"] > 0:
+                    try:
+                        q0, note = self.risk.position_size(
+                            price, price * (1 - eff["stop_pct"] / 100), equity, cash)
+                        r["qty"] = q0
+                        r["size_note"] = note
+                    except Exception:
+                        pass
+
+                sig = strat.entry(hist, price, ctx)
+                if sig.side == "BUY":
+                    r["verdict"] = "BUY"
+                    r["reason"] = sig.reason
+                    r["_sig"] = sig
+                    r["_strategy"] = strat
+                elif snap["held"]:
+                    r["verdict"] = "HELD"
+                    r["reason"] = "이미 보유 중"
+                else:
+                    miss = [c.label for c in checks if not c.ok]
+                    near = (len(miss) <= 1) or (gap is not None and abs(gap) <= 1.0)
+                    r["verdict"] = "NEAR" if near else "WAIT"
+                    r["reason"] = sig.reason or (
+                        f"미충족: {', '.join(miss[:3])}" if miss else "조건 대기")
+            except Exception as e:
+                r["verdict"] = "ERROR"
+                r["reason"] = str(e)[:100]
+                log.debug("평가 실패 %s/%s: %s", symbol, strat.name, e)
+            snap["strategies"].append(r)
+        return snap
+
+    def _name(self, symbol: str) -> str:
+        try:
+            return self.store.stock_name(symbol) or symbol
+        except Exception:
+            return symbol
+
+    def _should_record(self, symbol: str, r: dict, now: datetime) -> bool:
+        """매 30초마다 전부 적재하면 하루 수만 행이 된다.
+
+        상태가 바뀐 순간과 10분 간격 스냅샷만 남긴다.
+        추세를 보기에는 충분하고 DB는 가볍게 유지된다.
+        """
+        key = (symbol, r["strategy"])
+        cur = (r["verdict"], r["passed"], round(r["gap_pct"], 1))
+        prev = self._eval_mark.get(key)
+        if prev is None or prev[0] != cur:
+            self._eval_mark[key] = (cur, now)
+            return True
+        if (now - prev[1]).total_seconds() >= 600:
+            self._eval_mark[key] = (cur, now)
+            return True
+        return False
+
+    def _block_note(self, why: str) -> None:
+        """같은 차단 사유로 로그를 도배하지 않는다 (5분에 한 번)."""
+        last, ts = self._last_block_msg
+        nowm = time.monotonic()
+        if why == last and nowm - ts < 300:
             return
-        if str(q.get("market_warn", "00")) not in ("00", ""):
+        self._last_block_msg = (why, nowm)
+        self.emit("risk", f"신규진입 차단: {why} (감시 스캔은 계속 돕니다)")
+
+    # -- 진입 ---------------------------------------------------------------
+    def _enter(self, symbol: str, snap: dict, hit: dict,
+               acct: dict, open_count: int) -> None:
+        """스캔에서 BUY 가 난 종목을 리스크 관문에 태우고 주문한다."""
+        strat: Strategy | None = hit.get("_strategy")
+        sig = hit.get("_sig")
+        if strat is None or sig is None:
+            return
+        price = float(snap.get("price") or 0)
+        if price <= 0 or snap.get("halt"):
+            return
+        if snap.get("warn"):
             self.emit("risk", f"{symbol} 시장경보 상태 - 진입 제외")
             return
 
-        for strat in self.strategies:
-            hist = self._hist(symbol, strat.timeframe)
-            if len(hist) < strat.warmup:
-                continue
-            ctx = {"today_open": float(q.get("open") or price),
-                   "now_hhmm": datetime.now().strftime("%H:%M")}
-            try:
-                sig = strat.entry(hist, price, ctx)
-            except Exception as e:
-                log.debug("진입 판단 실패 %s/%s: %s", symbol, strat.name, e)
-                continue
-            if sig.side != "BUY":
-                continue
+        equity = float(acct["total_eval"] or 0)
+        cash = float(acct["orderable_cash"] or acct["cash"] or 0)
+        sector = snap.get("sector") or ""
+        q = {"price": price, "change_pct": snap.get("change_pct", 0),
+             "volume": snap.get("volume", 0)}
 
-            sid = self.store.add_signal(symbol, strat.name, "BUY", price,
-                                        sig.strength, sig.reason, self.mode)
+        sid = self.store.add_signal(symbol, strat.name, "BUY", price,
+                                    sig.strength, sig.reason, self.mode)
 
-            ok, why = self.risk.check_entry(
-                symbol, equity, cash, open_count, sector,
-                self._sector_exposure(sector, acct, equity))
-            if not ok:
-                self.store.mark_signal(sid, False, why)
-                self.emit("risk", f"{symbol} 매수신호 차단: {why}")
-                return
-
-            qty, note = self.risk.position_size(price, sig.stop, equity, cash, sig.strength)
-            if qty <= 0:
-                self.store.mark_signal(sid, False, note)
-                self.emit("risk", f"{symbol} 수량 산출 실패: {note}")
-                return
-
-            # AI 리스크 필터 - 진입을 막을 수만 있고, 만들 수는 없다
-            if self.ai and self.cfg.ai.enabled and self.cfg.ai.veto_filter:
-                try:
-                    veto, vreason = self.ai.veto(symbol, q, sig.reason)
-                    if veto:
-                        self.store.mark_signal(sid, False, f"AI veto: {vreason}")
-                        self.emit("ai", f"{symbol} AI 진입거부: {vreason}")
-                        return
-                except Exception as e:
-                    log.debug("AI veto 실패: %s", e)
-
-            if not self.risk.lock(symbol):
-                self.store.mark_signal(sid, False, "중복 주문 방지")
-                return
-            try:
-                self.emit("signal", f"{symbol} 매수신호 [{strat.label}] {sig.reason} | {note}")
-                r = self.broker.buy(symbol, qty, price)
-                oid = self.store.add_order(self.mode, symbol, "BUY", qty, price, "-",
-                                           r.odno, r.org_no,
-                                           "FILLED" if r.ok else "FAILED",
-                                           r.message, strat.name, sid)
-                if not r.ok:
-                    self.store.mark_signal(sid, False, r.message)
-                    self.emit("error", f"{symbol} 매수 실패: {r.message}")
-                    return
-                self.store.add_fill(oid, symbol, "BUY", r.filled_qty, r.avg_price,
-                                    r.fee, r.tax)
-                stop = sig.stop if sig.stop > 0 else r.avg_price * 0.97
-                target = sig.target if sig.target > 0 else 0
-                self.store.open_trade(self.mode, symbol, strat.name, r.avg_price,
-                                      r.filled_qty, r.fee, stop, target)
-                self._filled_this_tick += 1
-                self.broker.invalidate_account()
-                self.store.mark_signal(sid, True)
-                self.emit("trade",
-                          f"매수 {symbol} {r.filled_qty}주 @{r.avg_price:,.0f} "
-                          f"| 손절 {stop:,.0f} / 목표 {target:,.0f}")
-            finally:
-                self.risk.unlock(symbol)
+        ok, why = self.risk.check_entry(
+            symbol, equity, cash, open_count, sector,
+            self._sector_exposure(sector, acct, equity))
+        if not ok:
+            self.store.mark_signal(sid, False, why)
+            self.emit("risk", f"{symbol} 매수신호 차단: {why}")
             return
+
+        qty, note = self.risk.position_size(price, sig.stop, equity, cash, sig.strength)
+        if qty <= 0:
+            self.store.mark_signal(sid, False, note)
+            self.emit("risk", f"{symbol} 수량 산출 실패: {note}")
+            return
+
+        # AI 리스크 필터 - 진입을 막을 수만 있고, 만들 수는 없다
+        if self.ai and self.cfg.ai.enabled and self.cfg.ai.veto_filter:
+            try:
+                veto, vreason = self.ai.veto(symbol, q, sig.reason)
+                if veto:
+                    self.store.mark_signal(sid, False, f"AI veto: {vreason}")
+                    self.emit("ai", f"{symbol} AI 진입거부: {vreason}")
+                    return
+            except Exception as e:
+                log.debug("AI veto 실패: %s", e)
+
+        if not self.risk.lock(symbol):
+            self.store.mark_signal(sid, False, "중복 주문 방지")
+            return
+        try:
+            self.emit("signal", f"{symbol} 매수신호 [{strat.label}] {sig.reason} | {note}")
+            r = self.broker.buy(symbol, qty, price)
+            oid = self.store.add_order(self.mode, symbol, "BUY", qty, price, "-",
+                                       r.odno, r.org_no,
+                                       "FILLED" if r.ok else "FAILED",
+                                       r.message, strat.name, sid)
+            if not r.ok:
+                self.store.mark_signal(sid, False, r.message)
+                self.emit("error", f"{symbol} 매수 실패: {r.message}")
+                return
+            self.store.add_fill(oid, symbol, "BUY", r.filled_qty, r.avg_price,
+                                r.fee, r.tax)
+            stop = sig.stop if sig.stop > 0 else r.avg_price * 0.97
+            target = sig.target if sig.target > 0 else 0
+            self.store.open_trade(self.mode, symbol, strat.name, r.avg_price,
+                                  r.filled_qty, r.fee, stop, target)
+            self._filled_this_tick += 1
+            self.broker.invalidate_account()
+            self.store.mark_signal(sid, True)
+            self.emit("trade",
+                      f"매수 {symbol} {r.filled_qty}주 @{r.avg_price:,.0f} "
+                      f"| 손절 {stop:,.0f} / 목표 {target:,.0f}")
+        finally:
+            self.risk.unlock(symbol)
+
 
     # -- 외부 보유 편입 ------------------------------------------------------
     def adopt_holdings(self) -> int:

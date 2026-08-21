@@ -10,7 +10,7 @@ import logging
 import sqlite3
 import threading
 from contextlib import contextmanager
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import Iterable, Any
 
@@ -103,6 +103,23 @@ CREATE INDEX IF NOT EXISTS ix_stocks_name ON stocks(name);
 CREATE TABLE IF NOT EXISTS recent_views (
     symbol TEXT PRIMARY KEY, ts TEXT
 );
+
+-- 감시 스캔 기록.
+-- "왜 안 샀는가"를 남기지 않으면 전략을 고칠 근거가 생기지 않는다.
+-- 매수 신호(signals)는 결과만 남지만 여기에는 과정이 남는다.
+CREATE TABLE IF NOT EXISTS watch_eval (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL, mode TEXT, symbol TEXT NOT NULL, strategy TEXT NOT NULL,
+    verdict TEXT,               -- BUY | NEAR | WAIT | SKIP | HELD | NODATA
+    score REAL,                 -- 조건 충족 비율 0.0~1.0
+    gap_pct REAL,               -- 진입 트리거까지 남은 거리(%). 음수 = 이미 넘음
+    price REAL, atr_pct REAL, change_pct REAL,
+    passed INTEGER, total INTEGER,
+    detail TEXT,                -- JSON: 조건 항목별 통과 여부
+    blocked_by TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_watch_eval_ts ON watch_eval(ts);
+CREATE INDEX IF NOT EXISTS ix_watch_eval_sym ON watch_eval(symbol, strategy, ts);
 """
 
 
@@ -273,6 +290,87 @@ class Store:
         return [dict(r) for r in
                 self.query("SELECT * FROM signals ORDER BY id DESC LIMIT ?", (limit,))]
 
+    # -- 감시 스캔 기록 ------------------------------------------------------
+    def add_evals(self, rows: list[dict]) -> None:
+        """감시 스캔 결과를 한꺼번에 적재한다.
+
+        매 루프마다 전 종목을 넣으면 하루 수만 행이 된다.
+        무엇을 남길지는 엔진이 고른다 (상태가 바뀐 것 + 주기적 스냅샷).
+        """
+        if not rows:
+            return
+        with self.conn() as c:
+            c.executemany(
+                "INSERT INTO watch_eval(ts,mode,symbol,strategy,verdict,score,gap_pct,"
+                "price,atr_pct,change_pct,passed,total,detail,blocked_by) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                [(r.get("ts") or _now(), r.get("mode", ""), r["symbol"], r["strategy"],
+                  r.get("verdict", ""), float(r.get("score") or 0),
+                  float(r.get("gap_pct") or 0), float(r.get("price") or 0),
+                  float(r.get("atr_pct") or 0), float(r.get("change_pct") or 0),
+                  int(r.get("passed") or 0), int(r.get("total") or 0),
+                  json.dumps(r.get("detail") or [], ensure_ascii=False),
+                  r.get("blocked_by", "")) for r in rows])
+
+    def recent_evals(self, limit: int = 300, mode: str | None = None,
+                     symbol: str = "") -> list[dict]:
+        q = "SELECT * FROM watch_eval WHERE 1=1"
+        a: list = []
+        if mode:
+            q += " AND mode=?"
+            a.append(mode)
+        if symbol:
+            q += " AND symbol=?"
+            a.append(symbol)
+        q += " ORDER BY id DESC LIMIT ?"
+        a.append(limit)
+        return [dict(r) for r in self.query(q, tuple(a))]
+
+    def eval_stats(self, days: int = 30, mode: str | None = None) -> list[dict]:
+        """종목 x 전략별로 관측이 얼마나 쌓였고 얼마나 근접했는지."""
+        q = ("SELECT symbol, strategy, COUNT(*) n, "
+             "SUM(CASE WHEN verdict='BUY' THEN 1 ELSE 0 END) buys, "
+             "SUM(CASE WHEN verdict='NEAR' THEN 1 ELSE 0 END) nears, "
+             "AVG(score) avg_score, MIN(ABS(gap_pct)) best_gap, "
+             "AVG(atr_pct) atr_pct, MAX(ts) last_ts "
+             "FROM watch_eval WHERE ts >= ?")
+        a: list = [(datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")]
+        if mode:
+            q += " AND mode=?"
+            a.append(mode)
+        q += " GROUP BY symbol, strategy ORDER BY buys DESC, avg_score DESC"
+        return [dict(r) for r in self.query(q, tuple(a))]
+
+    def eval_block_stats(self, days: int = 30, mode: str | None = None) -> list[dict]:
+        """조건별로 몇 번이나 발목을 잡았는가 - 전략 튜닝의 출발점."""
+        rows = self.recent_evals(limit=20000, mode=mode)
+        cut = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+        agg: dict[tuple[str, str], list[int]] = {}
+        for r in rows:
+            if (r.get("ts") or "") < cut:
+                continue
+            try:
+                detail = json.loads(r.get("detail") or "[]")
+            except (ValueError, TypeError):
+                continue
+            for d in detail:
+                key = (r["strategy"], str(d.get("label") or ""))
+                a = agg.setdefault(key, [0, 0])
+                a[0] += 1
+                if not d.get("ok"):
+                    a[1] += 1
+        out = [{"strategy": k[0], "label": k[1], "n": v[0], "fail": v[1],
+                "fail_pct": (v[1] / v[0] * 100) if v[0] else 0}
+               for k, v in agg.items()]
+        out.sort(key=lambda x: -x["fail"])
+        return out
+
+    def purge_evals(self, keep_days: int = 60) -> int:
+        cut = (datetime.now() - timedelta(days=keep_days)).strftime("%Y-%m-%d %H:%M:%S")
+        with self.conn() as c:
+            cur = c.execute("DELETE FROM watch_eval WHERE ts < ?", (cut,))
+            return cur.rowcount or 0
+
     # -- trades (완결 거래) --------------------------------------------------
     def open_trade(self, mode: str, symbol: str, strategy: str, price: float,
                    qty: int, fee: float, stop: float = 0, target: float = 0) -> int:
@@ -361,6 +459,15 @@ class Store:
         rows = self.query("SELECT ts,total_eval FROM equity WHERE mode=? "
                           "ORDER BY ts DESC LIMIT ?", (mode, limit))
         return [dict(r) for r in reversed(rows)]
+
+    def clear_equity(self, mode: str) -> None:
+        """가상계좌를 초기화할 때 자산 이력도 같이 지운다.
+
+        안 지우면 예전 예수금(예: 1,000만)이 최고점으로 남아서
+        새 예수금(500만)이 곧바로 '낙폭 50%'로 계산되고 엔진이 정지한다.
+        """
+        with self.conn() as c:
+            c.execute("DELETE FROM equity WHERE mode=?", (mode,))
 
     def peak_equity(self, mode: str) -> float:
         r = self.one("SELECT MAX(total_eval) m FROM equity WHERE mode=?", (mode,))
