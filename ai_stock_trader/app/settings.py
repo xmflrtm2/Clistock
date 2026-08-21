@@ -27,6 +27,61 @@ def _root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+def resource_path(*parts: str) -> Path:
+    """프로그램에 같이 묶여 나가는 파일(아이콘 등)의 경로.
+
+    _root() 와 다르다. 설정/DB 는 exe 옆에 두지만, 아이콘 같은 리소스는
+    PyInstaller onefile 이 임시폴더(_MEIPASS)에 풀어놓는다.
+    """
+    if getattr(sys, "frozen", False):
+        base = Path(getattr(sys, "_MEIPASS", "")) if getattr(sys, "_MEIPASS", "") else None
+        if base:
+            cand = base.joinpath(*parts)
+            if cand.exists():
+                return cand
+    return Path(__file__).resolve().parent.parent.joinpath(*parts)
+
+
+def icon_file() -> Path:
+    return resource_path("app", "icon.ico")
+
+
+def icon_png() -> Path:
+    return resource_path("app", "icon_256.png")
+
+
+# PyInstaller onefile 부트로더가 자식 프로세스에 물려주는 런타임 변수들.
+# 이 값들이 남아 있으면 새로 띄운 exe가 "나는 이미 압축해제된 자식이다" 라고
+# 착각해서 사라진 _MEIxxxxx 폴더를 찾거나, 부모 프로세스 검사에 걸려 죽는다.
+#   Security validation failure: parent process has different executable!
+_PYI_RUNTIME_VARS = (
+    "_PYI_ARCHIVE_FILE",
+    "_PYI_APPLICATION_HOME_DIR",
+    "_PYI_PARENT_PROCESS_LEVEL",
+    "_PYI_SPLASH_IPC",
+    "_PYI_LINUX_PROCESS_NAME",
+    "_MEIPASS2",
+    "_PYIBoot_SPLASH",
+)
+
+
+def child_env() -> dict:
+    """exe를 새 인스턴스로 띄울 때 쓸 깨끗한 환경변수.
+
+    업데이트 후 재실행, 백그라운드 운용 실행처럼 '앱이 앱을 띄우는' 자리에서
+    반드시 이걸 써야 한다. 그냥 물려주면 새 프로세스가 이전 프로세스의
+    임시 압축해제 폴더를 물고 들어가 실행에 실패한다.
+    """
+    env = dict(os.environ)
+    for k in _PYI_RUNTIME_VARS:
+        env.pop(k, None)
+    for k in [k for k in env if k.startswith("_PYI_")]:
+        env.pop(k, None)
+    # 최신 부트로더는 이 값만 봐도 환경을 초기화한다(구버전은 무시).
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    return env
+
+
 ROOT = _root()
 ENV_PATH = ROOT / ".env"
 CONFIG_PATH = ROOT / "config" / "settings.json"
@@ -128,6 +183,18 @@ class RiskConfig:
     max_sector_weight_pct: float = 40.0
     # 현금 최소 보유 비율 (%) - 전액 몰빵 방지
     min_cash_reserve_pct: float = 10.0
+
+    # -- 거래비용 / 체결현실성 관문 -----------------------------------------
+    # 기대이익이 왕복 거래비용의 몇 배 이상일 때만 진입하는가 (0 = 관문 끔).
+    # 5년 백테스트에서 전략 대부분은 시장에 진 게 아니라 거래비용에 졌다.
+    # 그 손실은 전략을 고쳐서 되찾는 게 아니라 "이 거래는 애초에 할 값어치가
+    # 없다"를 진입 전에 가려내서 막아야 한다.
+    min_edge_cost_ratio: float = 3.0
+    # 최근 평균 거래대금 하한 (원, 0 = 관문 끔).
+    # 살 때는 아무 문제 없다가 팔 때 못 빠져나오는 종목을 미리 거른다.
+    min_turnover_amount: int = 500_000_000
+    # 평균 거래대금을 낼 봉 수
+    turnover_lookback: int = 20
 
 
 @dataclass

@@ -3,7 +3,7 @@
     pip install pyinstaller
     python build.py
 
-결과: dist/KIS자동매매.exe  (하나만 나온다)
+결과: Clistock.exe  (하나만 나온다)
 .env / config / data / logs 는 exe 옆에 생성되므로 exe와 같은 폴더에 .env를 두면 된다.
 """
 from __future__ import annotations
@@ -23,7 +23,8 @@ for _s in (sys.stdout, sys.stderr):
         pass
 
 ROOT = Path(__file__).resolve().parent
-NAME = "KIS자동매매"
+# 릴리즈 자산명과 같아야 한다. GitHub 이 자산 이름의 한글을 잘라내므로 ASCII.
+NAME = "Clistock"
 
 
 def main() -> int:
@@ -57,7 +58,13 @@ def main() -> int:
     ]
     icon = ROOT / "app" / "icon.ico"
     if icon.exists():
-        args[-1:-1] = ["--icon", str(icon)]     # run.py 앞에 끼워넣는다
+        # --icon 은 exe 파일 아이콘, --add-data 는 창 아이콘용(런타임에 읽는다).
+        # 둘 다 같은 파일을 써야 작업표시줄과 창 제목줄이 어긋나지 않는다.
+        args[-1:-1] = ["--icon", str(icon),
+                       "--add-data", f"{icon}{os.pathsep}app"]
+        png = ROOT / "app" / "icon_256.png"
+        if png.exists():
+            args[-1:-1] = ["--add-data", f"{png}{os.pathsep}app"]
 
     print("빌드 시작...\n  " + " ".join(args[2:]))
     r = subprocess.run(args, cwd=ROOT)
@@ -93,7 +100,7 @@ def make_shortcut(target: Path) -> None:
     desktop = Path.home() / "Desktop"
     if not desktop.exists():
         return
-    lnk = desktop / f"{NAME}.lnk"
+    lnk = desktop / "KIS 자동매매.lnk"
     ps = (
         f"$s=(New-Object -ComObject WScript.Shell).CreateShortcut('{lnk}');"
         f"$s.TargetPath='{target}';"

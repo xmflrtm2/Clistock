@@ -10,6 +10,8 @@
   - 연속 손실 후 뇌동매매 -> 쿨다운
   - 중복/과매매         -> 종목별 주문 잠금 + 재진입 쿨다운 + 일일 주문수 상한
   - 몰빵                -> 종목당 비중 상한 + 현금 최소보유
+  - 비용에 지는 매매     -> 기대이익이 왕복 거래비용의 N배 미만이면 진입 자체를 취소
+  - 못 빠져나오는 종목   -> 평균 거래대금 하한 / 1주 가격 대비 주문상한 확인
 """
 from __future__ import annotations
 
@@ -19,10 +21,50 @@ import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
-from .settings import RiskConfig
+from .kis_client import tick_size
+from .settings import CostConfig, RiskConfig
 from .storage import Store
 
 log = logging.getLogger(__name__)
+
+
+# --------------------------------------------------------------------------
+# 거래비용 계산 - 백테스터와 실거래 엔진이 같은 식을 쓴다.
+# --------------------------------------------------------------------------
+def norm_market(name: str) -> str:
+    """KIS가 돌려주는 시장명을 호가단위 계산용 코드로 정규화한다."""
+    s = (name or "").upper()
+    return "KOSDAQ" if ("KOSDAQ" in s or "코스닥" in s) else "KOSPI"
+
+
+def round_trip_cost_pct(cost: CostConfig, price: float = 0.0,
+                        market: str = "KOSPI") -> float:
+    """한 번 사고 파는 데 확정적으로 빠져나가는 비용(%).
+
+    수수료는 양방향, 증권거래세는 매도에만, 슬리피지는 양방향이다.
+    가격을 주면 최소 호가단위(1틱)를 함께 본다. 저가주는 1틱이 슬리피지
+    가정보다 큰 경우가 있는데, 1틱은 어떤 실력으로도 줄일 수 없는 비용이라
+    둘 중 큰 쪽을 슬리피지로 쓴다.
+    """
+    slip = float(cost.slippage_pct)
+    if price > 0:
+        slip = max(slip, tick_size(price, market) / price * 100)
+    return cost.commission_pct * 2 + cost.sell_tax_pct + slip * 2
+
+
+def avg_turnover(bars: list[dict], lookback: int = 20) -> float:
+    """최근 N봉의 평균 거래대금(원). 캔들에 금액이 없으면 종가 x 거래량."""
+    if not bars:
+        return 0.0
+    seg = bars[-lookback:] if lookback > 0 else bars
+    vals = []
+    for b in seg:
+        v = float(b.get("value") or 0)
+        if v <= 0:
+            v = float(b.get("close") or 0) * float(b.get("volume") or 0)
+        if v > 0:
+            vals.append(v)
+    return sum(vals) / len(vals) if vals else 0.0
 
 
 @dataclass
@@ -60,10 +102,12 @@ class RiskManager:
     # 매매 없이 자산이 이만큼 변하면 입출금/초기화로 본다 (%)
     CAPITAL_JUMP_PCT = 12.0
 
-    def __init__(self, cfg: RiskConfig, store: Store, mode: str):
+    def __init__(self, cfg: RiskConfig, store: Store, mode: str,
+                 cost: CostConfig | None = None):
         self.cfg = cfg
         self.store = store
         self.mode = mode
+        self.cost = cost or CostConfig()
         self.state = RiskState()
         self._lock = threading.RLock()
 
@@ -196,9 +240,53 @@ class RiskManager:
 
         return True, ""
 
+    # -- 거래비용 관문 -------------------------------------------------------
+    def cost_pct(self, price: float = 0.0, market: str = "KOSPI") -> float:
+        return round_trip_cost_pct(self.cost, price, market)
+
+    def edge_ratio(self, price: float, stop_pct: float, target_pct: float,
+                   market: str = "KOSPI") -> tuple[float, float, float]:
+        """(기대이익%, 왕복비용%, 배수)를 돌려준다.
+
+        목표가가 있으면 목표폭이 기대이익이다. 목표 없이 추세를 끝까지 타는
+        전략은 손절폭을 1R로 보고 그걸 기대이익의 하한으로 쓴다.
+        손절폭조차 비용 몇 배가 안 되면, 이겨도 남는 게 없는 거래다.
+        """
+        edge = target_pct if target_pct > 0 else stop_pct
+        c = self.cost_pct(price, market)
+        return edge, c, (edge / c if c > 0 else 0.0)
+
+    def check_cost_edge(self, price: float, stop_pct: float, target_pct: float,
+                        market: str = "KOSPI") -> tuple[bool, str]:
+        need = float(getattr(self.cfg, "min_edge_cost_ratio", 0) or 0)
+        if need <= 0:
+            return True, ""
+        edge, c, ratio = self.edge_ratio(price, stop_pct, target_pct, market)
+        if edge <= 0 or c <= 0:
+            return True, ""          # 폭을 못 내놓는 전략은 다른 관문에 맡긴다
+        if ratio < need:
+            kind = "목표" if target_pct > 0 else "손절폭"
+            return False, (f"기대이익({kind} {edge:.2f}%) / 왕복비용 {c:.2f}% "
+                           f"= {ratio:.1f}배 < 최소 {need:.1f}배 - 이겨도 비용이 먹는 거래")
+        return True, ""
+
+    def check_liquidity(self, price: float, turnover: float = 0.0) -> tuple[bool, str]:
+        c = self.cfg
+        if price > 0 and price > c.max_order_amount:
+            return False, (f"1주 {price:,.0f}원 > 1회 주문상한 {c.max_order_amount:,}원 "
+                           f"- 1주도 살 수 없음")
+        need = float(getattr(c, "min_turnover_amount", 0) or 0)
+        if need > 0 and 0 < turnover < need:
+            return False, (f"평균 거래대금 {turnover / 1e8:.1f}억 < 하한 "
+                           f"{need / 1e8:.1f}억 - 팔고 싶을 때 못 빠져나올 수 있음")
+        return True, ""
+
     def check_entry(self, symbol: str, equity: float, cash: float,
                     open_positions: int, sector: str = "",
-                    sector_exposure_pct: float = 0.0) -> tuple[bool, str]:
+                    sector_exposure_pct: float = 0.0,
+                    price: float = 0.0, stop_pct: float = 0.0,
+                    target_pct: float = 0.0, turnover: float = 0.0,
+                    market: str = "KOSPI") -> tuple[bool, str]:
         """종목별 진입 관문."""
         c = self.cfg
         ok, why = self.check_global(equity)
@@ -233,6 +321,15 @@ class RiskManager:
         if cash - reserve < c.min_order_amount:
             return False, (f"현금 부족 (가용 {max(cash - reserve, 0):,.0f}원 "
                            f"< 최소주문 {c.min_order_amount:,}원)")
+
+        # 체결 현실성 - 팔 수 있는 종목인가, 1주라도 살 수 있는가
+        if price > 0:
+            ok, why = self.check_liquidity(price, turnover)
+            if not ok:
+                return False, why
+            ok, why = self.check_cost_edge(price, stop_pct, target_pct, market)
+            if not ok:
+                return False, why
 
         return True, ""
 

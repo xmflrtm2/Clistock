@@ -13,6 +13,7 @@
   - 몬테카를로 손실확률 45% 미만 (운이 나빠도 버티나)
   - 연도별 수익난 해 절반 이상  (특정 해에만 벌었나)
   - 최대낙폭 35% 이하         (실제로 들고 있을 수 있나)
+  - 그냥 사서 들고 있는 것보다 나음 (매매가 값어치를 만들었나)
 
 관문을 통과한 것만 점수를 매기고, 하나도 통과 못 하면 "추천할 게 없습니다"라고 말한다.
 그게 억지로 하나 고르는 것보다 훨씬 쓸모 있다.
@@ -79,6 +80,10 @@ GATES = {
     "max_loss_prob": 45.0,
     "min_consistency": 50.0,
     "max_mdd": 35.0,
+    # 바이앤홀드를 최소 몇 %p 이겨야 하는가.
+    # 그냥 사서 들고만 있어도 나오는 수익을, 매매 위험을 지고 겨우 따라잡은
+    # 전략은 쓸 이유가 없다. 0%p 로 두면 "동점이면 탈락"이 된다.
+    "min_alpha_pp": 0.0,
 }
 
 
@@ -111,6 +116,11 @@ class Candidate:
     @property
     def consistency(self) -> float:
         return self.period_sum.get("consistency", 0.0)
+
+    @property
+    def alpha(self) -> float:
+        """바이앤홀드 대비 초과수익(%p)."""
+        return self.metrics.get("alpha_pct", 0.0)
 
 
 @dataclass
@@ -313,7 +323,9 @@ class Scanner:
                 f"  최대낙폭          {b.metrics.get('mdd_pct', 0):.1f}%  "
                 f"(나쁜 경우 {b.mc.get('mdd_p95', 0):.1f}%)\n"
                 f"  거래 / 승률       {b.metrics.get('trades', 0)}건 / "
-                f"{b.metrics.get('win_rate', 0)}%\n\n"
+                f"{b.metrics.get('win_rate', 0)}%\n"
+                f"  그냥 보유했다면   {b.metrics.get('bh_return_pct', 0):+.2f}%  "
+                f"(초과수익 {b.alpha:+.2f}%p)\n\n"
                 f"주의 - {res.tested}개를 훑어서 고른 1등입니다. 많이 훑을수록 "
                 f"우연히 좋아 보이는 것이 섞이기 쉬우므로, 모의투자로 충분히 "
                 f"확인한 뒤에 실전을 생각하세요."
@@ -387,6 +399,10 @@ class Scanner:
             fails.append(f"연도일관성 {c.consistency:.0f}% < {GATES['min_consistency']:.0f}%")
         if m.get("mdd_pct", 99) > GATES["max_mdd"]:
             fails.append(f"MDD {m.get('mdd_pct', 0):.0f}% > {GATES['max_mdd']:.0f}%")
+        # 그냥 사서 들고 있는 것보다 못하면, 매매를 한 이유가 없다.
+        if m.get("bh_symbols") and c.alpha <= GATES["min_alpha_pp"]:
+            fails.append(f"바이앤홀드 대비 {c.alpha:+.1f}%p "
+                         f"(보유 {m.get('bh_return_pct', 0):+.1f}%)")
         c.fails = fails
         c.passed = not fails
 

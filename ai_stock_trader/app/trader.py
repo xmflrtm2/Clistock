@@ -24,7 +24,7 @@ from datetime import datetime, date
 from .broker import Broker, OrderResult
 from .collector import Collector
 from .market import MarketCalendar, hhmm
-from .risk import RiskManager
+from .risk import RiskManager, avg_turnover, norm_market
 from .settings import AppConfig
 from .storage import Store
 from .strategies import Check, Position, Strategy, build
@@ -44,7 +44,7 @@ class TradingEngine:
         self.ai = ai
         self.notifier = notifier
         self.mode = broker.mode
-        self.risk = RiskManager(cfg.risk, store, self.mode)
+        self.risk = RiskManager(cfg.risk, store, self.mode, cfg.cost)
 
         self.strategies: list[Strategy] = []
         for s in cfg.strategies:
@@ -412,6 +412,7 @@ class TradingEngine:
         rows: list[dict] = []
         buys: list[str] = []
         nears: list[str] = []
+        gated: list[str] = []
 
         for symbol in self.cfg.watchlist:
             if self._stop.is_set():
@@ -426,6 +427,8 @@ class TradingEngine:
             for r in snap.get("strategies", []):
                 if r["verdict"] == "BUY":
                     buys.append(f"{symbol}/{r['label']}")
+                elif r["verdict"] == "GATED":
+                    gated.append(f"{symbol}/{r['label']}")
                 elif r["verdict"] == "NEAR":
                     nears.append(f"{symbol}/{r['label']} {r['gap_pct']:+.2f}%")
                 if self._should_record(symbol, r, now):
@@ -450,11 +453,15 @@ class TradingEngine:
 
         msg = (f"감시 {len(out)}종목 x 전략 {len(self.strategies)}개 평가 - "
                f"신호 {len(buys)} / 근접 {len(nears)}")
+        if gated:
+            msg += f" / 관문차단 {len(gated)}"
         if buys:
             msg += f" | 신호: {', '.join(buys[:4])}"
+        elif gated:
+            msg += f" | 차단: {', '.join(gated[:3])}"
         elif nears:
             msg += f" | 가장 가까움: {', '.join(nears[:3])}"
-        self.emit("scan", msg, {"buys": buys, "nears": nears})
+        self.emit("scan", msg, {"buys": buys, "nears": nears, "gated": gated})
         return out
 
     def _evaluate(self, symbol: str, now: datetime, held: set[str],
@@ -467,6 +474,9 @@ class TradingEngine:
         sector = (q.get("sector") or "").strip()
         if sector:
             self.store.set_sector(symbol, sector)
+
+        market = norm_market(q.get("market") or "")
+        turnover = self._turnover(symbol)
 
         snap = {
             "symbol": symbol,
@@ -481,6 +491,8 @@ class TradingEngine:
             "warn": str(q.get("market_warn", "00")) not in ("00", ""),
             "blocked": blocked,
             "atr_pct": 0.0,
+            "market": market,
+            "turnover": turnover,
             "strategies": [],
         }
         ctx = {"today_open": float(q.get("open") or price),
@@ -491,7 +503,8 @@ class TradingEngine:
                  "score": 0.0, "gap_pct": 0.0, "passed": 0, "total": 0,
                  "checks": [], "reason": "", "atr_pct": 0.0,
                  "stop_pct": 0.0, "target_pct": 0.0, "has_gap": False,
-                 "qty": 0, "size_note": ""}
+                 "qty": 0, "size_note": "",
+                 "cost_pct": 0.0, "edge_ratio": 0.0, "gate": ""}
             hist = self._hist(symbol, strat.timeframe)
             if len(hist) < strat.warmup:
                 r["verdict"] = "NODATA"
@@ -514,6 +527,13 @@ class TradingEngine:
                 r["target_pct"] = eff["target_pct"]
                 snap["atr_pct"] = max(snap["atr_pct"], eff["atr_pct"])
 
+                # 이 거래가 거래비용을 이길 폭을 가지고 있는가.
+                # 신호가 난 뒤가 아니라 나기 전에 계산해서 화면에 드러낸다.
+                _edge, cpct, ratio = self.risk.edge_ratio(
+                    price, eff["stop_pct"], eff["target_pct"], market)
+                r["cost_pct"] = cpct
+                r["edge_ratio"] = ratio
+
                 # 지금 신호가 나면 실제로 몇 주나 살 수 있는가.
                 # 손절폭이 넓어질수록 수량은 줄어든다. 0주면 신호가 나도 못 산다 -
                 # 그 사실을 신호가 난 뒤가 아니라 미리 보여준다.
@@ -528,10 +548,19 @@ class TradingEngine:
 
                 sig = strat.entry(hist, price, ctx)
                 if sig.side == "BUY":
-                    r["verdict"] = "BUY"
-                    r["reason"] = sig.reason
-                    r["_sig"] = sig
-                    r["_strategy"] = strat
+                    # 전략은 사자고 하지만 시스템이 막을 수 있다.
+                    # 막힌 사실과 사유를 BUY 와 구분해서 남긴다.
+                    gate_ok, gate_why = self._entry_gates(
+                        price, eff, turnover, market)
+                    if not gate_ok:
+                        r["verdict"] = "GATED"
+                        r["gate"] = gate_why
+                        r["reason"] = f"{sig.reason} / 관문차단: {gate_why}"
+                    else:
+                        r["verdict"] = "BUY"
+                        r["reason"] = sig.reason
+                        r["_sig"] = sig
+                        r["_strategy"] = strat
                 elif snap["held"]:
                     r["verdict"] = "HELD"
                     r["reason"] = "이미 보유 중"
@@ -547,6 +576,25 @@ class TradingEngine:
                 log.debug("평가 실패 %s/%s: %s", symbol, strat.name, e)
             snap["strategies"].append(r)
         return snap
+
+    def _entry_gates(self, price: float, eff: dict, turnover: float,
+                     market: str) -> tuple[bool, str]:
+        """전략 신호가 나도 이 관문을 못 넘으면 주문하지 않는다."""
+        ok, why = self.risk.check_liquidity(price, turnover)
+        if not ok:
+            return False, why
+        return self.risk.check_cost_edge(price, eff["stop_pct"],
+                                         eff["target_pct"], market)
+
+    def _turnover(self, symbol: str) -> float:
+        """평균 거래대금. 일봉 기준이라 장 초반에도 값이 흔들리지 않는다."""
+        if not float(getattr(self.cfg.risk, "min_turnover_amount", 0) or 0):
+            return 0.0
+        try:
+            return avg_turnover(self._hist(symbol, "D"),
+                                int(getattr(self.cfg.risk, "turnover_lookback", 20) or 20))
+        except Exception:
+            return 0.0
 
     def _name(self, symbol: str) -> str:
         try:
@@ -606,7 +654,11 @@ class TradingEngine:
 
         ok, why = self.risk.check_entry(
             symbol, equity, cash, open_count, sector,
-            self._sector_exposure(sector, acct, equity))
+            self._sector_exposure(sector, acct, equity),
+            price=price, stop_pct=hit.get("stop_pct") or 0,
+            target_pct=hit.get("target_pct") or 0,
+            turnover=snap.get("turnover") or 0,
+            market=snap.get("market") or "KOSPI")
         if not ok:
             self.store.mark_signal(sid, False, why)
             self.emit("risk", f"{symbol} 매수신호 차단: {why}")

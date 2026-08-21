@@ -13,6 +13,13 @@
   3. 몬테카를로 - 같은 거래들이 다른 순서로 일어났다면 결과가 어땠을까?
                운 좋은 순서 하나를 보고 판단하지 않기 위해서다.
                최악 구간(MDD)의 분포가 실제로 버틸 수 있는 수준인지 본다.
+
+  4. 워크포워드 - 위 셋을 다 통과해도 남는 함정이 하나 있다.
+               "전 구간을 보고 고른 파라미터"는 그 구간을 이미 알고 있다.
+               실전에서는 미래를 모르는 채로 골라야 한다.
+               그래서 앞 구간에서만 고르고, 뒤 구간 성적만 채점한다.
+               이 성적이 전 구간 최적화 성적보다 훨씬 나쁘면,
+               앞에서 본 수익률은 재현되지 않는 숫자였다는 뜻이다.
 """
 from __future__ import annotations
 
@@ -48,6 +55,37 @@ class Sensitivity:
     spread: float = 0.0            # 최고 - 최저 수익률 (%p)
     neighbor_gap: float = 0.0      # 최고점과 이웃값의 차이 (%p)
     flatness: float = 0.0          # 0~1, 1에 가까울수록 평탄(견고)
+    verdict: str = ""
+    error: str = ""
+
+
+@dataclass
+class WFFold:
+    idx: int = 0
+    train_start: str = ""
+    train_end: str = ""
+    test_start: str = ""
+    test_end: str = ""
+    value: object = None          # 학습구간에서 고른 파라미터 값
+    is_return: float = 0.0        # 학습구간 성적 (고른 값 기준)
+    oos_return: float = 0.0       # 검증구간 성적 - 이게 진짜 점수다
+    oos_mdd: float = 0.0
+    oos_trades: int = 0
+    bh_return: float = 0.0        # 같은 검증구간 바이앤홀드
+    note: str = ""
+
+
+@dataclass
+class WalkForward:
+    param: str = ""
+    folds: list = field(default_factory=list)
+    is_return_pct: float = 0.0     # 학습구간 수익률을 복리로 이은 값
+    oos_return_pct: float = 0.0    # 검증구간 수익률을 복리로 이은 값
+    bh_return_pct: float = 0.0
+    efficiency: float = 0.0        # OOS / IS. 1에 가까울수록 재현성 높음
+    positive_folds: int = 0
+    param_stability: float = 0.0   # 폴드마다 같은 값이 뽑혔나 (0~1)
+    best_value: object = None
     verdict: str = ""
     error: str = ""
 
@@ -206,6 +244,187 @@ class Analyzer:
                    else "연도별 편차가 비교적 작습니다.")
             ),
         }
+
+    # ------------------------------------------------------------------
+    def walk_forward(self, strategy: str, base_params: dict, risk: RiskConfig,
+                     symbols: list[str], param: str, values: list,
+                     folds: int = 4, cash: int = 10_000_000,
+                     log_fn=None) -> WalkForward:
+        """앞 구간에서만 파라미터를 고르고, 뒤 구간 성적으로만 채점한다.
+
+        전체 구간을 (folds+1) 등분해서 확장형(anchored)으로 민다.
+
+            [--- 학습 ---][검증]
+            [------ 학습 ------][검증]
+            [-------- 학습 --------][검증]
+
+        검증구간은 고를 때 한 번도 보지 않은 데이터다. 여기 성적만 이어붙인
+        것이 "실전에서 이 방식대로 운용했다면"에 가장 가까운 숫자다.
+        """
+        from datetime import date, timedelta
+        from .strategies import build
+
+        out = WalkForward(param=param)
+        vals = [v for v in (values or []) if v is not None]
+        if not vals:
+            out.error = "탐색할 파라미터 값이 없습니다."
+            return out
+        if folds < 2:
+            folds = 2
+
+        strat = build(strategy, base_params)
+        warm_days = int(strat.warmup * 1.6) + 20
+
+        lo = hi = None
+        for sym in symbols:
+            a, b = self.store.candle_range(sym, strat.timeframe)
+            if not a or not b:
+                continue
+            a, b = a[:10], b[:10]
+            lo = a if lo is None or a < lo else lo
+            hi = b if hi is None or b > hi else hi
+        if not lo or not hi:
+            out.error = (f"{strat.timeframe} 데이터가 없습니다. "
+                         f"[데이터] 탭에서 먼저 수집하세요.")
+            return out
+
+        d0, d1 = date.fromisoformat(lo), date.fromisoformat(hi)
+        span = (d1 - d0).days
+        seg = span // (folds + 1)
+        if seg < 60:
+            out.error = (f"기간이 {span}일뿐입니다. {folds}폴드로 나누면 구간당 "
+                         f"{seg}일이라 검증이 무의미합니다 (구간당 60일 이상 필요).")
+            return out
+
+        bt = self._bt(risk)
+        is_c = oos_c = bh_c = 1.0
+        picks: list = []
+
+        for i in range(folds):
+            tr_end = d0 + timedelta(days=seg * (i + 1))
+            te_end = d1 if i == folds - 1 else d0 + timedelta(days=seg * (i + 2))
+            f = WFFold(idx=i + 1, train_start=d0.isoformat(),
+                       train_end=tr_end.isoformat(),
+                       test_start=tr_end.isoformat(), test_end=te_end.isoformat())
+
+            # --- 학습구간: 여기서만 고른다 ---
+            best = None
+            for v in vals:
+                r = bt.run(strategy, {**base_params, param: v}, symbols, cash,
+                           start=f.train_start, end=f.train_end)
+                if r.error or r.metrics.get("trades", 0) < 10:
+                    continue
+                key = (r.metrics.get("return_over_mdd", 0),
+                       r.metrics.get("total_return_pct", 0))
+                if best is None or key > best[0]:
+                    best = (key, v, r.metrics.get("total_return_pct", 0))
+            if best is None:
+                f.note = "학습구간에 쓸 만한 표본이 없음 (거래 10건 미만)"
+                out.folds.append(f)
+                if log_fn:
+                    log_fn(f"  폴드 {f.idx}: {f.note}")
+                continue
+
+            f.value, f.is_return = best[1], best[2]
+            picks.append(best[1])
+
+            # --- 검증구간: 고를 때 보지 않은 데이터 ---
+            warm_start = (tr_end - timedelta(days=warm_days)).isoformat()
+            r = bt.run(strategy, {**base_params, param: f.value}, symbols, cash,
+                       start=warm_start, end=f.test_end)
+            if r.error:
+                f.note = r.error[:80]
+                out.folds.append(f)
+                continue
+            seg_eq = [(d, v) for d, v in r.equity if d >= f.test_start]
+            if len(seg_eq) < 10:
+                f.note = "검증구간 데이터 부족"
+                out.folds.append(f)
+                continue
+
+            base = seg_eq[0][1] or cash
+            f.oos_return = (seg_eq[-1][1] / base - 1) * 100
+            peak, mdd = base, 0.0
+            for _d, v in seg_eq:
+                peak = max(peak, v)
+                if peak > 0:
+                    mdd = max(mdd, (peak - v) / peak * 100)
+            f.oos_mdd = mdd
+            f.oos_trades = sum(1 for t in r.trades
+                               if (t.get("exit_ts") or "") >= f.test_start)
+            f.bh_return = self._bh_window(symbols, strat.timeframe,
+                                          f.test_start, f.test_end)
+
+            is_c *= (1 + f.is_return / 100)
+            oos_c *= (1 + f.oos_return / 100)
+            bh_c *= (1 + f.bh_return / 100)
+            out.folds.append(f)
+            if log_fn:
+                log_fn(f"  폴드 {f.idx} [{f.test_start}~{f.test_end}] "
+                       f"{param}={f.value} -> 학습 {f.is_return:+.1f}% / "
+                       f"검증 {f.oos_return:+.1f}% (보유 {f.bh_return:+.1f}%, "
+                       f"{f.oos_trades}건)")
+
+        scored = [f for f in out.folds if f.value is not None and not f.note]
+        if not scored:
+            out.error = ("채점할 수 있는 폴드가 없습니다. "
+                         "데이터 기간을 늘리거나 폴드 수를 줄이세요.")
+            return out
+
+        out.is_return_pct = (is_c - 1) * 100
+        out.oos_return_pct = (oos_c - 1) * 100
+        out.bh_return_pct = (bh_c - 1) * 100
+        out.positive_folds = sum(1 for f in scored if f.oos_return > 0)
+        out.efficiency = (out.oos_return_pct / out.is_return_pct
+                          if out.is_return_pct > 0 else 0.0)
+        if picks:
+            keys = [str(v) for v in picks]
+            top = max(set(keys), key=keys.count)
+            out.param_stability = keys.count(top) / len(keys)
+            out.best_value = picks[keys.index(top)]
+
+        out.verdict = self._wf_verdict(out, len(scored))
+        return out
+
+    # ------------------------------------------------------------------
+    def _bh_window(self, symbols: list[str], tf: str, start: str,
+                   end: str) -> float:
+        """그 구간을 그냥 사서 들고 있었을 때의 수익률(%). 동일가중."""
+        rets = []
+        for sym in symbols:
+            bars = self.store.get_candles(sym, tf, limit=200_000,
+                                          start=start, end=end)
+            if len(bars) < 2:
+                continue
+            a, b = float(bars[0]["close"] or 0), float(bars[-1]["close"] or 0)
+            if a > 0 and b > 0:
+                rets.append((b / a - 1) * 100)
+        return sum(rets) / len(rets) if rets else 0.0
+
+    @staticmethod
+    def _wf_verdict(w: "WalkForward", n: int) -> str:
+        eff, oos = w.efficiency, w.oos_return_pct
+        head = (f"{n}개 검증구간 중 {w.positive_folds}개에서 수익. "
+                f"학습 {w.is_return_pct:+.1f}% -> 검증 {oos:+.1f}% "
+                f"(같은 기간 그냥 보유 {w.bh_return_pct:+.1f}%). ")
+        if oos <= 0:
+            body = ("검증구간 합계가 손실입니다. 학습구간 성적이 아무리 좋아도 "
+                    "그건 답을 보고 맞춘 것이라 실전에 넣을 근거가 못 됩니다.")
+        elif oos <= w.bh_return_pct:
+            body = ("검증구간에서 벌긴 했지만 그냥 사서 들고 있는 것보다 못합니다. "
+                    "매매 자체가 가치를 만들지 못하고 있습니다.")
+        elif eff < 0.3:
+            body = (f"검증 성적이 학습 성적의 {eff * 100:.0f}%밖에 안 됩니다. "
+                    f"파라미터가 과거에 맞춰져 있다는 신호입니다.")
+        elif w.param_stability < 0.5:
+            body = (f"폴드마다 최적값이 달라집니다 "
+                    f"(일치율 {w.param_stability * 100:.0f}%). "
+                    f"어떤 값을 써야 할지 데이터가 말해주지 못하는 상태입니다.")
+        else:
+            body = (f"검증구간에서도 재현됐고 (효율 {eff * 100:.0f}%), "
+                    f"최적값도 {w.param_stability * 100:.0f}% 일치합니다. "
+                    f"실전 후보로 볼 만합니다.")
+        return head + body
 
     # ------------------------------------------------------------------
     def monte_carlo(self, trades: list[dict], initial: float,

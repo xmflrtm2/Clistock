@@ -6,6 +6,9 @@
   * 갭으로 손절가를 뛰어넘으면 시가에 체결 (손절가 체결 아님)
   * 신호는 직전 봉까지의 데이터로만 만든다 (미래참조 차단)
   * 거래 횟수가 적으면 결과에 경고를 붙인다
+  * 실거래와 똑같은 비용/유동성 관문을 진입에 적용한다
+    (백테스트에서만 사는 거래가 있으면 그 수익률은 실현되지 않는다)
+  * 같은 기간 같은 종목을 그냥 사서 들고 있었을 때와 비교한다
 
 그리고 실거래와 같은 Strategy 객체, 같은 사이징 공식을 쓴다.
 """
@@ -15,6 +18,7 @@ import logging
 import math
 from dataclasses import dataclass, field
 
+from .risk import avg_turnover, round_trip_cost_pct
 from .settings import CostConfig, RiskConfig
 from .storage import Store
 from .strategies import Position, Strategy, build
@@ -87,6 +91,7 @@ class Backtester:
         positions: dict[str, BTPosition] = {}
         trades: list[dict] = []
         costs = {"fee": 0.0, "tax": 0.0, "slip": 0.0}
+        gated = {"cost": 0, "liquidity": 0}
         equity_curve: list[tuple[str, float]] = []
         day_mark = ""
 
@@ -188,6 +193,13 @@ class Backtester:
                     costs["slip"] += (fill - entry_px) * 0   # 수량 확정 후 아래에서 더한다
                     stop = sig.stop if sig.stop > 0 else fill * 0.97
                     target = sig.target if sig.target > 0 else 0
+
+                    # 실거래와 같은 관문. 여기서 거른 거래는 실계좌에서도 안 산다.
+                    gate = self._gate(fill, stop, target, hist)
+                    if gate:
+                        gated[gate] += 1
+                        continue
+
                     qty = self._size(fill, stop, equity, cash, sig.strength)
                     if qty <= 0:
                         continue
@@ -214,11 +226,110 @@ class Backtester:
         res.trades = trades
         res.equity = equity_curve
         res.metrics = self._metrics(trades, equity_curve, initial_cash, costs)
+        res.metrics.update(self._buy_hold(data, timeline, index, initial_cash))
+        res.metrics["gated_cost"] = gated["cost"]
+        res.metrics["gated_liquidity"] = gated["liquidity"]
+        res.metrics["alpha_pct"] = round(
+            res.metrics.get("total_return_pct", 0)
+            - res.metrics.get("bh_return_pct", 0), 2)
         res.warnings += self._warn(res.metrics, trades)
+        if gated["cost"] or gated["liquidity"]:
+            res.warnings.append(
+                f"관문에서 진입 취소 {gated['cost'] + gated['liquidity']}건 "
+                f"(비용 {gated['cost']} / 유동성 {gated['liquidity']}) - "
+                f"관문을 끄면 거래는 늘지만 실계좌에서 재현되지 않는 거래가 섞인다.")
         if log_fn:
             log_fn(f"백테스트 완료: {len(trades)}거래, "
                    f"수익률 {res.metrics.get('total_return_pct', 0):.2f}%")
         return res
+
+    # ------------------------------------------------------------------
+    def _gate(self, price: float, stop: float, target: float,
+              hist: list[dict]) -> str:
+        """진입을 취소해야 하면 사유 키를, 통과면 빈 문자열을 돌려준다.
+
+        실거래 엔진(risk.py)이 쓰는 것과 같은 식이다. 백테스트에서만 통과하는
+        거래가 있으면 그 수익률은 실계좌에서 나오지 않는다.
+        """
+        c = self.risk
+        need = float(getattr(c, "min_edge_cost_ratio", 0) or 0)
+        if need > 0 and price > 0:
+            edge = ((target - price) / price * 100) if target > 0 else                    ((price - stop) / price * 100)
+            cpct = round_trip_cost_pct(self.cost, price)
+            if edge > 0 and cpct > 0 and edge / cpct < need:
+                return "cost"
+
+        turn_need = float(getattr(c, "min_turnover_amount", 0) or 0)
+        if price > 0 and price > c.max_order_amount:
+            return "liquidity"
+        if turn_need > 0:
+            t = avg_turnover(hist, int(getattr(c, "turnover_lookback", 20) or 20))
+            if 0 < t < turn_need:
+                return "liquidity"
+        return ""
+
+    # ------------------------------------------------------------------
+    def _buy_hold(self, data: dict, timeline: list[str], index: dict,
+                  initial: float) -> dict:
+        """같은 기간 같은 종목을 동일가중으로 사서 끝까지 들고 있었다면.
+
+        비교 대상 없이는 수익률 숫자가 아무 뜻이 없다. 전략이 +12%라도
+        그냥 들고 있는 게 +30%였다면, 그 전략은 돈을 벌어준 게 아니라
+        수수료와 시간을 써서 수익을 깎은 것이다.
+        매수 수수료와 마지막 매도 수수료/세금까지 똑같이 뺀다.
+        """
+        if not data or not timeline:
+            return {"bh_return_pct": 0.0, "bh_mdd_pct": 0.0, "bh_final": 0}
+
+        per = initial / len(data)
+        holds: dict[str, int] = {}
+        cash = float(initial)
+        for sym, bars in data.items():
+            px = float(bars[0]["close"] or 0)
+            if px <= 0:
+                continue
+            qty = int(per // px)
+            if qty <= 0:
+                continue
+            amount = qty * px
+            cash -= amount + round(amount * self.cost.commission_pct / 100)
+            holds[sym] = qty
+        if not holds:
+            return {"bh_return_pct": 0.0, "bh_mdd_pct": 0.0, "bh_final": 0}
+
+        last_px = {s: float(data[s][0]["close"] or 0) for s in holds}
+        curve: list[float] = []
+        day_mark = ""
+        for ti, ts in enumerate(timeline):
+            day = ts[:10]
+            for s in holds:
+                i = index[s].get(ts)
+                if i is not None:
+                    last_px[s] = float(data[s][i]["close"] or last_px[s])
+            is_last = (ti == len(timeline) - 1) or (timeline[ti + 1][:10] != day)
+            if is_last and day != day_mark:
+                day_mark = day
+                curve.append(cash + sum(q * last_px[s] for s, q in holds.items()))
+
+        gross = sum(q * last_px[s] for s, q in holds.items())
+        exit_cost = round(gross * (self.cost.commission_pct
+                                   + self.cost.sell_tax_pct) / 100)
+        final = cash + gross - exit_cost
+        if curve:
+            curve[-1] = final
+
+        peak, mdd = (curve[0] if curve else initial), 0.0
+        for v in curve:
+            peak = max(peak, v)
+            if peak > 0:
+                mdd = max(mdd, (peak - v) / peak * 100)
+
+        return {
+            "bh_return_pct": round((final - initial) / initial * 100, 2),
+            "bh_mdd_pct": round(mdd, 2),
+            "bh_final": round(final),
+            "bh_symbols": len(holds),
+        }
 
     # ------------------------------------------------------------------
     def _size(self, price: float, stop: float, equity: float,
@@ -329,6 +440,18 @@ class Backtester:
             w.append("승률은 높지만 손익비가 낮음 - 한 번 크게 물리는 유형.")
         if m.get("profit_factor", 0) and m["profit_factor"] > 3 and n < 100:
             w.append("Profit Factor가 비정상적으로 높음 - 과최적화 의심.")
+        bh = m.get("bh_return_pct")
+        if bh is not None and m.get("bh_symbols"):
+            net_r = m.get("total_return_pct", 0)
+            if net_r <= bh:
+                w.append(f"같은 기간 그냥 사서 들고 있었으면 {bh:+.1f}%인데 "
+                         f"전략은 {net_r:+.1f}% - 매매를 해서 오히려 깎였다. "
+                         f"MDD가 더 낮은 것도 아니라면 이 전략을 쓸 이유가 없다.")
+            elif m.get("mdd_pct", 0) > m.get("bh_mdd_pct", 0) and net_r - bh < 5:
+                w.append(f"바이앤홀드보다 {net_r - bh:+.1f}%p 앞서지만 "
+                         f"낙폭은 더 크다 ({m.get('mdd_pct', 0):.1f}% vs "
+                         f"{m.get('bh_mdd_pct', 0):.1f}%) - 위험 대비 이득이 없다.")
+
         gross, net = m.get("gross_return_pct", 0), m.get("total_return_pct", 0)
         if gross > 0 >= net:
             w.append(f"비용 전에는 +{gross:.1f}%인데 비용 반영 후 {net:.1f}% - "

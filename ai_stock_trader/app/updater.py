@@ -26,7 +26,7 @@ from pathlib import Path
 import requests
 
 from .version import APP_NAME, GITHUB_REPO, __version__, is_newer
-from .settings import _env
+from .settings import _env, child_env
 
 log = logging.getLogger(__name__)
 
@@ -161,6 +161,16 @@ chcp 65001 >nul
 title {app} 업데이트
 echo {app} 를 업데이트하는 중입니다. 창을 닫지 마세요.
 
+rem PyInstaller onefile 런타임 변수를 지운다.
+rem 이게 남아 있으면 새로 띄운 exe가 이전 프로세스의 임시폴더를 물고 들어가
+rem "Security validation failure: parent process has different executable!" 로 죽는다.
+set "_PYI_ARCHIVE_FILE="
+set "_PYI_APPLICATION_HOME_DIR="
+set "_PYI_PARENT_PROCESS_LEVEL="
+set "_PYI_SPLASH_IPC="
+set "_MEIPASS2="
+set "PYINSTALLER_RESET_ENVIRONMENT=1"
+
 rem 실행 중인 프로세스가 끝날 때까지 기다린다 (파일이 잠겨 있으면 교체 불가)
 set /a tries=0
 :wait
@@ -172,11 +182,21 @@ timeout /t 1 /nobreak >nul
 goto wait
 
 :ready
-timeout /t 1 /nobreak >nul
+rem onefile 런처(부모)가 임시폴더를 정리할 시간을 준다
+timeout /t 2 /nobreak >nul
 if exist "{bak}" del /f /q "{bak}"
-move /y "{target}" "{bak}" >nul
-if errorlevel 1 goto restore
-move /y "{new}" "{target}" >nul
+
+set /a swaps=0
+:swap
+move /y "{target}" "{bak}" >nul 2>&1
+if not errorlevel 1 goto place
+set /a swaps+=1
+if %swaps% GEQ 15 goto locked
+timeout /t 1 /nobreak >nul
+goto swap
+
+:place
+move /y "{new}" "{target}" >nul 2>&1
 if errorlevel 1 goto restore
 echo 업데이트 완료. 다시 실행합니다.
 start "" "{target}"
@@ -185,6 +205,11 @@ goto done
 :restore
 echo 교체에 실패했습니다. 원래 파일로 되돌립니다.
 if exist "{bak}" move /y "{bak}" "{target}" >nul
+start "" "{target}"
+goto done
+
+:locked
+echo 파일이 잠겨 있어 교체하지 못했습니다. 원래 파일 그대로 다시 실행합니다.
 start "" "{target}"
 goto done
 
@@ -205,8 +230,10 @@ def stage_install(new_exe: Path, target: Path | None = None) -> Path:
         _SCRIPT.format(app=APP_NAME, pid=os.getpid(), target=str(target),
                        new=str(new_exe), bak=str(target.with_suffix(".exe.bak"))),
         encoding="utf-8")
+    # 환경변수를 그대로 물려주면 새로 띄운 exe가 이 프로세스의 onefile 임시폴더를
+    # 자기 것으로 착각한다. 깨끗한 환경으로 넘겨야 재실행이 성공한다.
     subprocess.Popen(["cmd", "/c", "start", "", "/min", str(script)],
-                     shell=False,
+                     shell=False, env=child_env(),
                      creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
     log.info("업데이트 스크립트 실행: %s", script)
     return script

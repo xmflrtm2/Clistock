@@ -76,11 +76,9 @@ jobs:
         shell: bash
         run: |
           ls -la *.exe
-          test -s "KIS자동매매.exe" || { echo "::error::exe가 만들어지지 않았습니다"; exit 1; }
-          # GitHub 릴리즈는 자산 이름의 한글을 잘라낸다 (KIS자동매매.exe -> KIS.exe).
-          # 받는 사람이 뭘 받은 건지 알 수 있게 ASCII 이름으로 올린다.
-          cp "KIS자동매매.exe" "Clistock.exe"
-          ls -la Clistock.exe
+          # 자산 이름은 ASCII 여야 한다. GitHub 이 한글을 잘라내기 때문에
+          # KIS자동매매.exe 로 올리면 KIS.exe 가 되어 뭘 받은 건지 알 수 없다.
+          test -s "Clistock.exe" || { echo "::error::exe가 만들어지지 않았습니다"; exit 1; }
 
       - name: 릴리즈 생성 및 업로드
         uses: softprops/action-gh-release@v2

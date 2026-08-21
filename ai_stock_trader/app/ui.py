@@ -19,7 +19,7 @@ import customtkinter as ctk
 from dataclasses import asdict
 
 from .core import AppCore
-from .settings import save_env
+from .settings import icon_file, icon_png, save_env
 from .strategies import REGISTRY, default_params
 
 ctk.set_appearance_mode("dark")
@@ -33,6 +33,33 @@ MUTED = "#8a8a8a"
 OK = "#4caf50"
 WARN = "#ffb300"
 BAD = "#ef5350"
+
+
+def apply_icon(win, default: bool = False) -> None:
+    """창 아이콘을 exe 아이콘과 같은 파일로 맞춘다.
+
+    이걸 안 하면 작업표시줄에는 exe 아이콘, 창 제목줄에는 Tk 기본 깃털
+    아이콘이 나와서 서로 달라 보인다.
+    default=True 로 주면 이후 열리는 하위 창에도 같은 아이콘이 적용된다.
+    """
+    try:
+        path = icon_file()
+        if path.exists():
+            if default:
+                win.iconbitmap(default=str(path))
+            win.iconbitmap(str(path))
+    except Exception:
+        pass        # 아이콘 때문에 프로그램이 안 뜨면 안 된다
+    try:
+        # iconbitmap 은 작은 크기만 읽어 Alt-Tab 등에서 흐리게 확대된다.
+        # 큰 PNG 를 함께 걸어야 선명해진다. 참조를 붙들어야 GC 로 사라지지 않는다.
+        png = icon_png()
+        if png.exists():
+            img = tk.PhotoImage(file=str(png), master=win)
+            win._icon_ref = img
+            win.iconphoto(bool(default), img)
+    except Exception:
+        pass
 
 
 def money(v) -> str:
@@ -82,6 +109,7 @@ class App(ctk.CTk):
         super().__init__()
         from .version import __version__
         self.title(f"KIS 자동매매 시스템  v{__version__}")
+        apply_icon(self, default=True)
         self._fit_to_screen()
 
         self._q: queue.Queue = queue.Queue()
@@ -311,13 +339,15 @@ class App(ctk.CTk):
             ("sym", "종목", 130), ("price", "현재가", 85), ("chg", "등락", 70),
             ("atr", "변동성", 70), ("st", "전략", 110), ("vd", "판정", 60),
             ("cond", "조건", 60), ("gap", "트리거까지", 90),
-            ("lv", "손절/목표", 100), ("qty", "예상수량", 75),
+            ("lv", "손절/목표", 100), ("edge", "비용대비", 75),
+            ("qty", "예상수량", 75),
             ("why", "상태", 260)], 9)
         self.tv_watch_live.pack(fill="both", expand=True, padx=10, pady=(0, 4))
         self.tv_watch_live.tag_configure("buy", foreground=OK)
         self.tv_watch_live.tag_configure("near", foreground=WARN)
         self.tv_watch_live.tag_configure("held", foreground="#7fb3ff")
         self.tv_watch_live.tag_configure("dim", foreground=MUTED)
+        self.tv_watch_live.tag_configure("gated", foreground="#c98a5a")
         self.tv_watch_live.bind("<Double-1>", lambda _e: self._open_watch_detail())
         ctk.CTkLabel(watch, text="행을 더블클릭하면 조건별 판정을 자세히 볼 수 있습니다. "
                                  "변동성(ATR%)이 큰 종목일수록 손절/목표 폭이 자동으로 넓어집니다.",
@@ -923,6 +953,14 @@ class App(ctk.CTk):
                 ("max_order_amount", "1회 최대 주문금액 (원)", ""),
                 ("min_cash_reserve_pct", "최소 현금 보유 (%)", "몰빵 방지."),
             ]),
+            ("거래비용 / 체결현실성  (백테스트에도 똑같이 적용)", [
+                ("min_edge_cost_ratio", "기대이익 / 왕복비용 최소배수",
+                 "왕복비용은 수수료x2 + 매도세 + 슬리피지x2. 3배 미만이면 "
+                 "이겨도 비용이 먹는다. 0을 넣으면 관문을 끈다."),
+                ("min_turnover_amount", "평균 거래대금 하한 (원)",
+                 "이보다 적게 거래되는 종목은 팔고 싶을 때 못 판다. 0 = 끔."),
+                ("turnover_lookback", "거래대금 평균 기간 (봉)", "기본 20."),
+            ]),
         ]
         self.risk_fields: dict[str, ctk.CTkEntry] = {}
         for title, items in groups:
@@ -1073,7 +1111,11 @@ class App(ctk.CTk):
                       hover_color="#46709c", command=self._run_period).pack(side="left", padx=4)
         ctk.CTkButton(r3, text="몬테카를로", width=110, fg_color="#3a5f8a",
                       hover_color="#46709c", command=self._run_mc).pack(side="left", padx=4)
-        ctk.CTkLabel(r3, text="설정을 바꿨을 때 결과가 얼마나 흔들리는지 봅니다",
+        ctk.CTkButton(r3, text="워크포워드", width=110, fg_color="#5a4a8a",
+                      hover_color="#6a5a9c",
+                      command=self._run_walkforward).pack(side="left", padx=4)
+        ctk.CTkLabel(r3, text="워크포워드 = 앞 구간에서만 고르고 뒤 구간으로만 채점 "
+                              "(과최적화 최종 검증)",
                      text_color=MUTED, font=("", 11)).pack(side="left", padx=8)
         self.bt_strat.configure(command=lambda _v: self._refresh_param_list())
 
@@ -1167,6 +1209,12 @@ class App(ctk.CTk):
             f"    수수료/세금/슬리피지  {money(m.get('fee_total'))} / "
             f"{money(m.get('tax_total'))} / {money(m.get('slip_total'))}",
             f"연환산(CAGR)      {m.get('cagr_pct', 0):+.2f} %",
+            "",
+            f"그냥 보유했다면   {m.get('bh_return_pct', 0):+.2f} % "
+            f"(MDD {m.get('bh_mdd_pct', 0):.2f} %)   <- 같은 기간·같은 종목 동일가중",
+            f"초과수익(알파)    {m.get('alpha_pct', 0):+.2f} %p"
+            + ("   <- 매매해서 오히려 깎였다" if m.get('alpha_pct', 0) < 0 else ""),
+            "",
             f"최대낙폭(MDD)     {m.get('mdd_pct', 0):.2f} %      <- 실계좌에서 견딜 수 있는가",
             f"수익/MDD          {m.get('return_over_mdd', 0)}",
             f"Sharpe            {m.get('sharpe', 0)}",
@@ -1179,6 +1227,8 @@ class App(ctk.CTk):
             f"기대값(1거래당)   {money(m.get('expectancy'))} 원",
             f"최대 연속손실     {m.get('max_consecutive_losses', 0)} 회",
             f"평균 보유         {m.get('avg_bars_held', 0)} 봉",
+            f"관문에서 취소     {m.get('gated_cost', 0) + m.get('gated_liquidity', 0)} 건 "
+            f"(비용 {m.get('gated_cost', 0)} / 유동성 {m.get('gated_liquidity', 0)})",
         ]
         self.bt_metrics.configure(state="normal")
         self.bt_metrics.delete("1.0", "end")
@@ -1382,6 +1432,83 @@ class App(ctk.CTk):
         ] + _wrap(s["verdict"], 46)
         self._analysis_done(lines)
         self._log(f"연도별 분석 완료: {s['years']}년 중 {s['positive_years']}년 수익")
+
+    def _run_walkforward(self) -> None:
+        """앞 구간에서만 파라미터를 고르고, 뒤 구간 성적으로만 채점한다."""
+        got = self._bt_inputs()
+        if not got:
+            return
+        name, syms, rc, pname, cash = got
+        param = self.opt_param.get()
+        if param.startswith("("):
+            messagebox.showinfo("안내", "검증할 파라미터를 고르세요.")
+            return
+        from .analysis import suggest_values
+        cls = REGISTRY.get(name)
+        base = self._bt_params(name)
+        values = suggest_values(param, base.get(param))
+        if not values:
+            messagebox.showinfo("안내", f"'{param}'는 자동 탐색 범위를 잡을 수 없습니다.")
+            return
+
+        self._analysis_header(f"워크포워드 검증 - {cls.label} / {param}",
+                              pname, cash, syms)
+        self._btlog("전 구간을 보고 고른 파라미터는 이미 답을 알고 있습니다.")
+        self._btlog("여기서는 앞 구간에서만 고르고, 고를 때 보지 않은 뒤 구간으로만 채점합니다.")
+        self._btlog(f"탐색값: {values}")
+        self._btlog("")
+
+        def job():
+            from .analysis import Analyzer
+            an = Analyzer(self.core.store, self.core.cfg.cost)
+            try:
+                w = an.walk_forward(name, base, rc, syms, param, values,
+                                    folds=4, cash=cash,
+                                    log_fn=lambda m: self.after(0, self._btlog, m))
+            except Exception as ex:
+                self.after(0, lambda: self._analysis_done([f"실패: {ex}"]))
+                return
+            self.after(0, lambda: self._show_walkforward(param, w))
+        self._thread(job)
+
+    def _show_walkforward(self, param: str, w) -> None:
+        if w.error:
+            self._analysis_done([f"워크포워드 실패", "", *_wrap(w.error, 46)])
+            self._btlog(f"[실패] {w.error}")
+            return
+
+        self._btlog("")
+        self._btlog(f"{'폴드':<6}{'검증구간':<24}{param:>10}{'학습':>9}{'검증':>9}"
+                    f"{'보유':>9}{'거래':>6}")
+        for f in w.folds:
+            if f.note:
+                self._btlog(f"{f.idx:<6}{f.test_start}~{f.test_end}   {f.note}")
+                continue
+            self._btlog(f"{f.idx:<6}{f.test_start}~{f.test_end:<12}"
+                        f"{str(f.value):>10}{f.is_return:>8.1f}%{f.oos_return:>8.1f}%"
+                        f"{f.bh_return:>8.1f}%{f.oos_trades:>6}")
+
+        scored = [f for f in w.folds if f.value is not None and not f.note]
+        lines = [
+            f"검증 폴드          {len(scored)} 개",
+            f"수익난 폴드        {w.positive_folds}/{len(scored)}",
+            "",
+            f"학습구간 누적      {w.is_return_pct:+.2f} %   <- 답을 보고 고른 성적",
+            f"검증구간 누적      {w.oos_return_pct:+.2f} %   <- 실전에 가까운 성적",
+            f"그냥 보유했다면    {w.bh_return_pct:+.2f} %",
+            "",
+            f"재현 효율          {w.efficiency * 100:.0f} %   (검증/학습)",
+            f"최적값 일치율      {w.param_stability * 100:.0f} %   "
+            f"(폴드마다 같은 값이 뽑혔나)",
+            f"가장 많이 뽑힌 값  {param} = {w.best_value}",
+            "",
+            "판정:",
+        ] + _wrap(w.verdict, 46)
+        self._analysis_done(lines)
+        self._btlog("")
+        self._btlog(f"[판정] {w.verdict}")
+        self._log(f"워크포워드 완료: 검증 {w.oos_return_pct:+.1f}% / "
+                  f"효율 {w.efficiency * 100:.0f}%")
 
     def _run_mc(self) -> None:
         got = self._bt_inputs()
@@ -1922,9 +2049,13 @@ class App(ctk.CTk):
             runner = str(Path(__file__).resolve().parent.parent / "run.py")
             cmd = [pyw if Path(pyw).exists() else exe, runner, "--lab"] + names
         try:
+            from .settings import child_env
             flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            # 같은 exe를 새 인스턴스로 띄우는 자리다. onefile 런타임 변수를 물려주면
+            # 새 프로세스가 이 창의 임시 압축해제 폴더를 자기 것으로 쓰다가,
+            # 창을 닫는 순간 그 폴더가 지워져 백그라운드 운용이 함께 죽는다.
             subprocess.Popen(cmd, cwd=str(Path(__file__).resolve().parent.parent),
-                             creationflags=flags)
+                             env=child_env(), creationflags=flags)
         except Exception as e:
             messagebox.showerror("실행 실패", str(e))
             return
@@ -2718,7 +2849,7 @@ class App(ctk.CTk):
     # 감시 현황
     # ------------------------------------------------------------------
     VERDICT_LABEL = {"BUY": "신호", "NEAR": "근접", "WAIT": "대기", "HELD": "보유",
-                     "NODATA": "자료부족", "ERROR": "오류"}
+                     "GATED": "관문차단", "NODATA": "자료부족", "ERROR": "오류"}
 
     def _paint_watch(self) -> None:
         e = self.core.engine
@@ -2737,14 +2868,16 @@ class App(ctk.CTk):
         for sym, snap in scan.items():
             for r in snap.get("strategies", []):
                 rows.append((snap, r))
-        order = {"BUY": 0, "NEAR": 1, "HELD": 2, "WAIT": 3, "ERROR": 4, "NODATA": 5}
+        order = {"BUY": 0, "GATED": 1, "NEAR": 2, "HELD": 3, "WAIT": 4,
+                 "ERROR": 5, "NODATA": 6}
         rows.sort(key=lambda x: (order.get(x[1]["verdict"], 9),
                                  abs(x[1].get("gap_pct") or 0) if x[1].get("gap_pct")
                                  else (1 - (x[1].get("score") or 0)) * 100))
 
         for snap, r in rows:
             v = r["verdict"]
-            tag = {"BUY": "buy", "NEAR": "near", "HELD": "held"}.get(v, "dim")
+            tag = {"BUY": "buy", "NEAR": "near", "HELD": "held",
+                   "GATED": "gated"}.get(v, "dim")
             if v in ("NODATA", "ERROR"):
                 gap_s = "-"
             elif r.get("has_gap"):
@@ -2755,25 +2888,32 @@ class App(ctk.CTk):
                   if r.get("stop_pct") else "-")
             q = r.get("qty") or 0
             qty_s = f"{q}주" if q else ("0주" if r.get("size_note") else "-")
-            tv.insert("", "end", tags=("dim" if (not q and r.get("size_note")) else tag,),
-                      values=(
+            # 기대이익이 왕복 거래비용의 몇 배인가. 1배 미만이면 이겨도 남는 게 없다.
+            er = r.get("edge_ratio") or 0
+            edge_s = f"{er:.1f}배" if er else "-"
+            row_tag = tag
+            if v != "GATED" and not q and r.get("size_note"):
+                row_tag = "dim"
+            tv.insert("", "end", tags=(row_tag,), values=(
                 f"{snap.get('name') or snap['symbol']}",
                 money(snap.get("price")), f"{snap.get('change_pct', 0):+.2f}%",
                 f"{r.get('atr_pct') or snap.get('atr_pct', 0):.2f}%",
                 r["label"], self.VERDICT_LABEL.get(v, v),
                 f"{r['passed']}/{r['total']}" if r["total"] else "-",
-                gap_s, lv, qty_s, r.get("reason", "")[:110]))
+                gap_s, lv, edge_s, qty_s, r.get("reason", "")[:110]))
 
         n_buy = sum(1 for _, r in rows if r["verdict"] == "BUY")
         n_near = sum(1 for _, r in rows if r["verdict"] == "NEAR")
+        n_gate = sum(1 for _, r in rows if r["verdict"] == "GATED")
         # 신호가 떠도 0주면 못 산다. 그 사실을 미리 드러낸다.
         n_zero = sum(1 for _, r in rows
                      if r.get("size_note") and not r.get("qty")
                      and r["verdict"] in ("BUY", "NEAR", "WAIT"))
         ts = getattr(e, "last_scan_ts", None)
         txt = (f"{len(scan)}종목 x {len(rows) // max(len(scan), 1)}전략 = {len(rows)}건 "
-               f"| 신호 {n_buy} · 근접 {n_near} "
-               f"| {ts.strftime('%H:%M:%S') if ts else '-'} 기준")
+               f"| 신호 {n_buy} · 근접 {n_near}"
+               + (f" · 관문차단 {n_gate}" if n_gate else "")
+               + f" | {ts.strftime('%H:%M:%S') if ts else '-'} 기준")
         color = OK if n_buy else MUTED
         if n_zero:
             txt += (f"   ※ {n_zero}건은 신호가 나도 0주 "
@@ -2858,8 +2998,18 @@ class WatchDetailDialog(ctk.CTkToplevel):
                       f"손익비 {(r.get('target_pct') or 0) / r['stop_pct']:.2f}R")
         else:
             lv_txt = "손절폭 산출 불가"
+        cpct, er = r.get("cost_pct") or 0, r.get("edge_ratio") or 0
+        if cpct:
+            lv_txt += (f"\n왕복 거래비용 {cpct:.2f}%   ·   "
+                       f"기대이익은 그 {er:.1f}배"
+                       + ("   ← 이겨도 비용이 먹는다" if 0 < er < 2 else ""))
         ctk.CTkLabel(lv, anchor="w", justify="left", text_color=MUTED, font=("", 11),
                      text=lv_txt).pack(fill="x", padx=12, pady=(0, 4))
+        if r.get("gate"):
+            ctk.CTkLabel(lv, anchor="w", justify="left", font=("", 11),
+                         text_color=WARN, wraplength=700,
+                         text=f"전략은 매수 신호를 냈지만 시스템이 막았습니다: "
+                              f"{r['gate']}").pack(fill="x", padx=12, pady=(0, 4))
         if r.get("size_note"):
             ctk.CTkLabel(lv, anchor="w", justify="left", font=("", 11),
                          text_color=OK if r.get("qty") else BAD,
@@ -2919,6 +3069,7 @@ class ScanDialog(ctk.CTkToplevel):
         self.geometry("900x720")
         self.transient(app)
         self.grab_set()
+        self.after(220, lambda: apply_icon(self))
 
         ctk.CTkLabel(self, text="전략 자동 탐색", anchor="w",
                      font=("", 16, "bold")).pack(fill="x", padx=16, pady=(14, 2))
@@ -3120,6 +3271,8 @@ class ProfileDialog(ctk.CTkToplevel):
         ("max_orders_per_day", "하루 최대 주문 건수", ""),
         ("min_cash_reserve_pct", "최소 현금 보유 (%)", ""),
         ("max_consecutive_losses", "연속 손절 허용", ""),
+        ("min_edge_cost_ratio", "기대이익/비용 최소배수", "0 = 끔. 3배 권장"),
+        ("min_turnover_amount", "평균 거래대금 하한 (원)", "0 = 끔"),
     ]
     EXEC_FIELDS = [
         ("entry_start", "신규진입 시작", "HH:MM"),
@@ -3137,6 +3290,7 @@ class ProfileDialog(ctk.CTkToplevel):
         self.geometry("880x780")
         self.transient(app)
         self.grab_set()
+        self.after(220, lambda: apply_icon(self))
 
         from .profiles import HORIZONS
         sc = ctk.CTkScrollableFrame(self, fg_color="transparent")
