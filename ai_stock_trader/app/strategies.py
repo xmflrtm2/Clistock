@@ -659,11 +659,148 @@ class LongTermTrend(Strategy):
         return HOLD
 
 
+# --------------------------------------------------------------------------
+# 5. 조정 매수 - "저점"을 사는 게 아니라 "추세가 살아 있는데 눌린 것"을 산다.
+# --------------------------------------------------------------------------
+class DipBuy(Strategy):
+    name = "dip_buy"
+    label = "조정 매수"
+    description = ("52주 고점 대비 크게 밀렸지만 장기추세(200일선)는 아직 살아 있는 "
+                   "종목을 반등 조짐이 보일 때 산다. 많이 떨어졌다는 이유만으로는 "
+                   "사지 않는다 - 5년 데이터에서 그건 오히려 손해였다.")
+    timeframe = "D"
+    warmup = 260              # 52주 고점 + 200일선을 보려면 이만큼 필요하다
+    intrabar = False
+    exit_on_close = False
+    default_params = {
+        "dip_min_pct": 15.0,      # 52주 고점 대비 최소 이만큼은 밀려 있어야 한다
+        "dip_max_pct": 40.0,      # 이보다 더 밀렸으면 추세가 끝난 것으로 본다
+        "trend_ma": 200,          # 이 이평 위일 것 (추세 생존 조건)
+        "require_ma_rising": 1,   # 1이면 장기이평 자체도 우상향이어야 한다
+        "rsi_period": 14,
+        "rsi_max": 60.0,          # 이미 반등이 한참 진행됐으면 늦었다
+        "rebound_days": 3,        # 최근 N봉 안에 저점을 찍고 올라오는 중
+        "atr_stop": 3.0,
+        "stop_cap_atr": 3.5,
+        "hard_stop_pct": 25.0,
+        "take_profit_r": 0.0,     # 목표를 두지 않는다. 조정 회복은 오래 걸린다
+        "take_profit_pct": 0.0,
+        "trail_atr": 3.5,         # 트레일링으로만 따라간다
+        "breakeven_pct": 10.0,
+        "exit_ma": 200,           # 장기추세가 깨지면 나온다
+        "max_hold_bars": 0,       # 0 = 보유기간 제한 없음
+    }
+
+    # -- 공통 계산 (진입/진단이 같은 값을 보게 한다) ------------------------
+    def _state(self, hist: list[dict]) -> dict | None:
+        if not self._ok(hist):
+            return None
+        cs = ind.closes(hist)
+        ls = ind.lows(hist)
+        tma = ind.sma(cs, int(self.p["trend_ma"]))
+        r = ind.rsi(cs, int(self.p["rsi_period"]))
+        if tma[-1] is None or r[-1] is None:
+            return None
+
+        look = min(250, len(cs) - 1)
+        hi52 = max(cs[-1 - look:])
+        dip = (cs[-1] / hi52 - 1) * 100 if hi52 else 0.0
+
+        rise = min(20, len(tma) - 1)
+        ma_rising = bool(tma[-1 - rise] is not None and tma[-1] > tma[-1 - rise])
+
+        n = int(self.p["rebound_days"])
+        recent_low = min(ls[-n - 1:]) if len(ls) > n else ls[-1]
+        rebounding = cs[-1] > cs[-2] and cs[-1] > recent_low
+
+        return {
+            "close": cs[-1], "hi52": hi52, "dip": dip, "tma": tma[-1],
+            "ma_rising": ma_rising, "rsi": r[-1], "rebounding": rebounding,
+            "above_ma": cs[-1] > tma[-1],
+            "recent_low": recent_low,
+        }
+
+    def entry(self, hist: list[dict], price: float, ctx: dict) -> Signal:
+        stt = self._state(hist)
+        if stt is None:
+            return HOLD
+
+        lo, hi = float(self.p["dip_min_pct"]), float(self.p["dip_max_pct"])
+        if not (-hi <= stt["dip"] <= -lo):
+            return HOLD
+        if not stt["above_ma"]:
+            return HOLD
+        if self.p.get("require_ma_rising") and not stt["ma_rising"]:
+            return HOLD
+        if stt["rsi"] >= float(self.p["rsi_max"]):
+            return HOLD
+        if not stt["rebounding"]:
+            return HOLD
+
+        a = ind.last(ind.atr(hist, 14)) or (price * 0.02)
+        stop, target = self.levels(price, hist, price - float(self.p["atr_stop"]) * a)
+        # 장기이평 아래로는 어차피 나오므로 그보다 낮은 손절은 의미가 없다
+        stop = max(stop, stt["tma"] * 0.95)
+        return Signal("BUY", 1.0,
+                      f"조정 매수: 52주 고점 대비 {stt['dip']:.1f}% "
+                      f"(200일선 +{(stt['close'] / stt['tma'] - 1) * 100:.1f}%, "
+                      f"RSI {stt['rsi']:.0f}, 반등 시작)",
+                      stop=stop, target=target)
+
+    def checklist(self, hist: list[dict], price: float, ctx: dict) -> list[Check]:
+        stt = self._state(hist)
+        if stt is None:
+            return [Check("일봉 데이터", False, f"{len(hist)}/{self.warmup}봉")]
+        lo, hi = float(self.p["dip_min_pct"]), float(self.p["dip_max_pct"])
+        out = [
+            Check(f"고점 대비 -{lo:.0f}% 이상 조정", stt["dip"] <= -lo,
+                  f"{stt['dip']:.1f}% (52주고점 {stt['hi52']:,.0f})"),
+            Check(f"조정이 -{hi:.0f}% 이내 (추세 생존)", stt["dip"] >= -hi,
+                  f"{stt['dip']:.1f}%"),
+            Check(f"MA{int(self.p['trend_ma'])} 위", stt["above_ma"],
+                  f"{(stt['close'] / stt['tma'] - 1) * 100:+.1f}%"),
+        ]
+        if self.p.get("require_ma_rising"):
+            out.append(Check(f"MA{int(self.p['trend_ma'])} 우상향", stt["ma_rising"], ""))
+        out.append(Check(f"RSI < {self.p['rsi_max']:.0f} (안 늦었나)",
+                         stt["rsi"] < float(self.p["rsi_max"]), f"RSI {stt['rsi']:.1f}"))
+        out.append(Check(f"반등 시작 (최근 {int(self.p['rebound_days'])}봉 저점 위)",
+                         stt["rebounding"],
+                         f"저점 {stt['recent_low']:,.0f} / 현재 {stt['close']:,.0f}"))
+        return out
+
+    def exit(self, hist: list[dict], price: float, pos: Position, ctx: dict) -> Signal:
+        if pos.stop > 0 and price <= pos.stop:
+            return Signal("SELL", 1.0, f"손절/트레일링 (기준 {pos.stop:,.0f})")
+        if pos.target and price >= pos.target:
+            return Signal("SELL", 1.0, f"익절 (기준 {pos.target:,.0f})")
+        mh = int(self.p.get("max_hold_bars") or 0)
+        if mh and pos.bars_held >= mh:
+            return Signal("SELL", 1.0, f"보유기간 초과 ({pos.bars_held}봉)")
+        if not self._ok(hist):
+            return HOLD
+        cs = ind.closes(hist)
+        xma = ind.sma(cs, int(self.p["exit_ma"]))
+        if xma[-1] is not None and cs[-1] < xma[-1]:
+            return Signal("SELL", 1.0,
+                          f"추세 이탈 ({int(self.p['exit_ma'])}일선 하향)")
+        return HOLD
+
+    # 조정 깊이를 '트리거까지 남은 거리'로 쓴다 (감시 화면에서 근접도로 보인다)
+    def entry_gap_pct(self, hist: list[dict], price: float, ctx: dict) -> float | None:
+        stt = self._state(hist)
+        if stt is None:
+            return None
+        lo = float(self.p["dip_min_pct"])
+        # 아직 덜 밀렸으면 얼마나 더 밀려야 조건에 드는지
+        return max(0.0, stt["dip"] + lo)
+
 REGISTRY: dict[str, type[Strategy]] = {
     VolatilityBreakout.name: VolatilityBreakout,
     TrendPullback.name: TrendPullback,
     OpeningRangeBreakout.name: OpeningRangeBreakout,
     LongTermTrend.name: LongTermTrend,
+    DipBuy.name: DipBuy,
 }
 
 

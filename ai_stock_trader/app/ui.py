@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import queue
+import re
 import sys
 import threading
 import tkinter as tk
@@ -18,6 +19,7 @@ from tkinter import messagebox, ttk
 import customtkinter as ctk
 from dataclasses import asdict
 
+from . import glossary
 from .core import AppCore
 from .settings import icon_file, icon_png, save_env
 from .strategies import REGISTRY, default_params
@@ -102,6 +104,173 @@ def extra_fmt(label: str, value) -> str:
     if label == "거래대금":
         return f"대금 {f:,.0f}"
     return f"{label} {f:,.0f}"
+
+
+class Tip:
+    """마우스를 올리면 뜨는 설명 풍선.
+
+    text 자리에 함수를 주면 그때그때 계산해서 띄운다 (표 헤더, 지표 줄처럼
+    커서 위치에 따라 내용이 달라지는 곳에 쓴다). 함수가 None을 돌려주면
+    아무것도 띄우지 않는다.
+    """
+
+    _open: "Tip | None" = None
+
+    def __init__(self, widget, text, delay: int = 350, wrap: int = 460):
+        self.w = widget
+        self.text = text
+        self.delay = delay
+        self.wrap = wrap
+        self._after = None
+        self._win = None
+        self._last = None
+        widget.bind("<Enter>", self._enter, add="+")
+        widget.bind("<Leave>", self._leave, add="+")
+        widget.bind("<ButtonPress>", self._leave, add="+")
+
+    # -- 내부 --------------------------------------------------------------
+    def _resolve(self, ev) -> str | None:
+        try:
+            return self.text(ev) if callable(self.text) else self.text
+        except Exception:
+            return None
+
+    def _enter(self, ev=None):
+        self._schedule(ev)
+
+    def _schedule(self, ev):
+        self._cancel()
+        x, y = self.w.winfo_pointerxy()
+        self._after = self.w.after(self.delay, lambda: self._show(x, y, ev))
+
+    def _cancel(self):
+        if self._after:
+            try:
+                self.w.after_cancel(self._after)
+            except Exception:
+                pass
+            self._after = None
+
+    def _show(self, px, py, ev):
+        txt = self._resolve(ev)
+        if not txt:
+            return
+        self._hide()
+        if Tip._open is not None and Tip._open is not self:
+            Tip._open._hide()
+        try:
+            win = tk.Toplevel(self.w)
+            win.wm_overrideredirect(True)
+            win.attributes("-topmost", True)
+            frame = tk.Frame(win, bg="#5a5a5a", bd=0)
+            frame.pack()
+            tk.Label(frame, text=txt, justify="left", anchor="w",
+                     bg="#20242b", fg="#e8e8e8", wraplength=self.wrap,
+                     font=("맑은 고딕", 10), padx=12, pady=9).pack(padx=1, pady=1)
+            win.update_idletasks()
+            w, h = win.winfo_width(), win.winfo_height()
+            sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+            x = min(px + 16, sw - w - 8)
+            y = py + 22
+            if y + h > sh - 8:            # 아래로 넘치면 커서 위로
+                y = max(py - h - 12, 8)
+            win.wm_geometry(f"+{max(x, 8)}+{y}")
+            self._win = win
+            Tip._open = self
+        except Exception:
+            self._win = None
+
+    def _hide(self):
+        if self._win is not None:
+            try:
+                self._win.destroy()
+            except Exception:
+                pass
+            self._win = None
+        if Tip._open is self:
+            Tip._open = None
+
+    def _leave(self, _ev=None):
+        self._cancel()
+        self._last = None
+        self._hide()
+
+    # -- 커서 위치에 따라 내용이 바뀌는 곳에서 호출 -------------------------
+    def repoint(self, ev, key) -> None:
+        """가리키는 대상이 바뀌면 풍선을 다시 띄운다."""
+        if key == self._last:
+            return
+        self._last = key
+        self._hide()
+        self._cancel()
+        if key is None:
+            return
+        self._schedule(ev)
+
+
+def help_badge(parent, key: str, pad: tuple = (4, 0)):
+    """라벨 옆에 붙는 [?] 배지. 설명이 없는 용어면 아무것도 만들지 않는다."""
+    txt = glossary.look(key)
+    if not txt:
+        return None
+    lb = ctk.CTkLabel(parent, text=" ? ", width=18, height=18,
+                      font=("", 11, "bold"), text_color="#9fb8d8",
+                      fg_color="#2b3340", corner_radius=9)
+    lb.pack(side="left", padx=pad)
+    Tip(lb, txt)
+    return lb
+
+
+def tree_help(tree, cols) -> None:
+    """표 머리글에 마우스를 올리면 그 열의 설명을 띄운다."""
+    titles = {f"#{i + 1}": c[1] for i, c in enumerate(cols)}
+    if not any(glossary.has(t) for t in titles.values()):
+        return
+    tip = Tip(tree, None)
+
+    def on_move(ev):
+        try:
+            if tree.identify_region(ev.x, ev.y) != "heading":
+                tip.repoint(ev, None)
+                return
+            col = tree.identify_column(ev.x)
+        except Exception:
+            return
+        title = titles.get(col)
+        desc = glossary.look(title) if title else None
+        tip.text = desc
+        tip.repoint(ev, col if desc else None)
+
+    tree.bind("<Motion>", on_move, add="+")
+    tree.bind("<Leave>", lambda e: tip.repoint(e, None), add="+")
+
+
+def text_help(box) -> None:
+    """지표 텍스트 상자에서 커서가 놓인 줄의 용어 설명을 띄운다.
+
+    한 줄의 맨 앞 라벨(값이 시작되기 전까지)을 잘라 사전에서 찾는다.
+    """
+    inner = getattr(box, "_textbox", box)
+    tip = Tip(inner, None)
+
+    def label_at(ev) -> tuple[str | None, str | None]:
+        try:
+            idx = inner.index(f"@{ev.x},{ev.y}")
+            line = inner.get(f"{idx} linestart", f"{idx} lineend")
+        except Exception:
+            return None, None
+        if not line.strip():
+            return None, None
+        head = re.split(r"\s{2,}", line.strip())[0].strip()
+        return head, glossary.look(head)
+
+    def on_move(ev):
+        head, desc = label_at(ev)
+        tip.text = desc
+        tip.repoint(ev, head if desc else None)
+
+    inner.bind("<Motion>", on_move, add="+")
+    inner.bind("<Leave>", lambda e: tip.repoint(e, None), add="+")
 
 
 class App(ctk.CTk):
@@ -230,8 +399,10 @@ class App(ctk.CTk):
         t = ttk.Treeview(parent, columns=[c[0] for c in cols],
                          show="headings", height=height)
         for key, title, w in cols:
-            t.heading(key, text=title)
+            # 설명이 있는 열은 제목에 ? 를 붙여 '올려보면 나온다'를 알린다
+            t.heading(key, text=(f"{title} ?" if glossary.has(title) else title))
             t.column(key, width=w, anchor="e" if w < 110 else "w")
+        tree_help(t, cols)
         return t
 
     # ==================================================================
@@ -413,8 +584,10 @@ class App(ctk.CTk):
         right.pack(side="right", fill="both", expand=True, padx=(5, 4))
         self.sub = ctk.CTkTabview(right, anchor="nw", height=430)
         self.sub.pack(fill="both", expand=True, padx=6, pady=6)
-        for n in ("관심종목", "감시분석", "보유종목", "최근조회", "국내순위", "해외순위"):
+        for n in ("관심종목", "조정 레이더", "감시분석", "보유종목", "최근조회",
+                  "국내순위", "해외순위"):
             self.sub.add(n)
+        self._tab_radar(self.sub.tab("조정 레이더"))
         self._tab_watch_stats(self.sub.tab("감시분석"))
 
         self.tv_watch = self._quote_tree(self.sub.tab("관심종목"))
@@ -494,6 +667,106 @@ class App(ctk.CTk):
     # ------------------------------------------------------------------
     # 감시 분석 - 관측이 쌓일수록 "어디서 막히는지"가 드러난다
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # 조정 레이더 - 주문은 내지 않는다. "지금 어디쯤인지"만 보여준다.
+    # ------------------------------------------------------------------
+    def _tab_radar(self, p) -> None:
+        head = ctk.CTkFrame(p, fg_color="transparent")
+        head.pack(fill="x", pady=(6, 2))
+        ctk.CTkLabel(head, text="조정 레이더", font=("", 13, "bold")).pack(side="left",
+                                                                      padx=(4, 10))
+        self.lbl_radar = ctk.CTkLabel(head, text="계산 전", text_color=MUTED,
+                                      font=("", 11))
+        self.lbl_radar.pack(side="left")
+        ctk.CTkButton(head, text="새로고침", width=90,
+                      command=self._refresh_radar).pack(side="right", padx=4)
+        ctk.CTkButton(head, text="＋ 관심 종목 담기", width=130, fg_color="#3a3a3a",
+                      hover_color="#4a4a4a",
+                      command=lambda: self._add_selected(self.tv_radar)
+                      ).pack(side="right", padx=4)
+
+        ctk.CTkLabel(p, anchor="w", justify="left", text_color=MUTED, wraplength=1000,
+                     font=("", 11),
+                     text=("5년 데이터에서 '많이 떨어졌으니 산다'는 아무 날에나 사는 것보다 "
+                           "나빴습니다 (RSI<30 은 1년 후 -21%p, 200일선 -15% 는 -19%p). "
+                           "고점 대비 크게 밀렸어도 200일선 위에 있는 경우만 +55%p 앞섰습니다.\n"
+                           "그래서 이 화면은 '싼 종목'이 아니라 '추세가 살아 있는데 눌린 종목'을 "
+                           "찾습니다. 주문은 내지 않습니다 - 판단은 직접 하세요.\n"
+                           "일봉이 쌓인 종목을 전부 훑습니다. 더 넓게 보려면 [데이터] 탭에서 "
+                           "종목을 추가로 수집하세요 (260봉 이상 필요).")
+                     ).pack(fill="x", padx=6, pady=(2, 6))
+
+        self.tv_radar = self._tree(p, [
+            ("code", "코드", 65), ("sym", "종목", 125), ("price", "현재가", 95),
+            ("dip", "고점대비", 80), ("ma200", "200일선", 80),
+            ("ma60", "60일선", 75), ("rsi", "RSI", 55),
+            ("stage", "단계", 85), ("trend", "추세", 80),
+            ("vd", "판정", 60), ("watch", "관심", 50),
+            ("hist", "과거 유사국면 1년후", 150), ("why", "설명", 300)], 16)
+        self.tv_radar.pack(fill="both", expand=True, padx=4, pady=(0, 4))
+        self.tv_radar.tag_configure("hot", foreground=OK)
+        self.tv_radar.tag_configure("warn", foreground=WARN)
+        self.tv_radar.tag_configure("bad", foreground=BAD)
+        self.tv_radar.tag_configure("dim", foreground=MUTED)
+        self.tv_radar.bind("<Double-1>", lambda _e: self._add_selected(self.tv_radar))
+
+        ctk.CTkLabel(p, anchor="w", text_color=MUTED, font=("", 10),
+                     text=("과거 유사국면 = 이 종목이 과거에 같은 상태였을 때 1년 뒤 수익률의 "
+                           "중앙값입니다. 표본이 몇 건뿐이라 참고용입니다 "
+                           "(평균은 한 번의 대박에 휘둘려 중앙값을 씁니다).")
+                     ).pack(fill="x", padx=6, pady=(0, 6))
+        self.after(2500, self._refresh_radar)
+
+    def _refresh_radar(self) -> None:
+        if getattr(self, "_radar_busy", False):
+            return
+        self._radar_busy = True
+        self.lbl_radar.configure(text="계산 중…", text_color=MUTED)
+
+        def job():
+            try:
+                from .radar import DipRadar
+                if getattr(self, "_radar", None) is None:
+                    self._radar = DipRadar(self.core.store)
+                # 관심종목만 보면 이미 보고 있는 것만 다시 본다.
+                # 일봉이 쌓인 종목은 전부 훑어야 새 기회가 눈에 들어온다.
+                targets = list(dict.fromkeys(
+                    list(self.core.cfg.watchlist)
+                    + list(self.core.store.symbols_with_data("D"))))
+                rows = self._radar.scan(targets)
+                summary = DipRadar.summary(rows)
+            except Exception as e:
+                self.after(0, lambda: self._radar_failed(str(e)))
+                return
+            self.after(0, lambda: self._paint_radar(rows, summary))
+        threading.Thread(target=job, daemon=True).start()
+
+    def _radar_failed(self, msg: str) -> None:
+        self._radar_busy = False
+        self.lbl_radar.configure(text=f"계산 실패: {msg[:80]}", text_color=BAD)
+        self._log(f"조정 레이더 실패: {msg}", "error")
+
+    def _paint_radar(self, rows, summary: str) -> None:
+        self._radar_busy = False
+        wl = set(self.core.cfg.watchlist)
+        tv = self.tv_radar
+        for i in tv.get_children():
+            tv.delete(i)
+        for r in rows:
+            tag = {"관심": "hot", "관망": "warn", "위험": "bad"}.get(r.verdict, "dim")
+            hist = "-"
+            if r.hist_n:
+                hist = f"{r.hist_n}건 중앙 {r.hist_median:+.0f}%"
+                if r.hist_win is not None:
+                    hist += f" (승 {r.hist_win:.0f}%)"
+            tv.insert("", "end", tags=(tag,), values=(
+                r.symbol, r.name, money(r.price), f"{r.dip_pct:.1f}%",
+                f"{r.ma200_dev:+.1f}%", f"{r.ma60_dev:+.1f}%", f"{r.rsi:.0f}",
+                r.stage, r.trend, r.verdict,
+                "●" if r.symbol in wl else "", hist, r.reason[:150]))
+        hot = sum(1 for r in rows if r.verdict == "관심")
+        self.lbl_radar.configure(text=summary, text_color=OK if hot else MUTED)
+
     def _tab_watch_stats(self, p) -> None:
         bar = ctk.CTkFrame(p, fg_color="transparent")
         bar.pack(fill="x", pady=(6, 4))
@@ -881,6 +1154,7 @@ class App(ctk.CTk):
                 ctk.CTkLabel(cell, text=self.PARAM_LABEL.get(k, k), width=150,
                              anchor="w", text_color=MUTED,
                              font=("", 11)).pack(side="left")
+                help_badge(cell, self.PARAM_LABEL.get(k, k), pad=(0, 4))
                 e = ctk.CTkEntry(cell, width=80, height=28)
                 e.insert(0, str(v))
                 e.pack(side="left")
@@ -1101,7 +1375,10 @@ class App(ctk.CTk):
 
         r3 = ctk.CTkFrame(bar, fg_color="transparent")
         r3.pack(fill="x", padx=12, pady=(0, 12))
-        ctk.CTkLabel(r3, text="견고성 분석", font=("", 12, "bold")).pack(side="left", padx=(0, 10))
+        ctk.CTkLabel(r3, text="견고성 분석", font=("", 12, "bold")).pack(side="left", padx=(0, 2))
+        help_badge(r3, "민감도", pad=(2, 2))
+        help_badge(r3, "몬테카를로", pad=(0, 2))
+        help_badge(r3, "워크포워드", pad=(0, 10))
         ctk.CTkLabel(r3, text="민감도 대상").pack(side="left")
         self.opt_param = ctk.CTkOptionMenu(r3, width=170, values=["(전략 선택)"])
         self.opt_param.pack(side="left", padx=6)
@@ -1128,11 +1405,16 @@ class App(ctk.CTk):
                      font=("", 13, "bold")).pack(fill="x", padx=12, pady=(10, 2))
         self.canvas = tk.Canvas(left, bg=CARD, highlightthickness=0, height=250)
         self.canvas.pack(fill="both", expand=True, padx=10, pady=(0, 6))
-        ctk.CTkLabel(left, text="지표", anchor="w",
-                     font=("", 13, "bold")).pack(fill="x", padx=12, pady=(4, 2))
-        self.bt_metrics = ctk.CTkTextbox(left, height=170, font=("Consolas", 12))
+        mh = ctk.CTkFrame(left, fg_color="transparent")
+        mh.pack(fill="x", padx=12, pady=(4, 2))
+        ctk.CTkLabel(mh, text="지표", anchor="w",
+                     font=("", 13, "bold")).pack(side="left")
+        ctk.CTkLabel(mh, text="용어에 마우스를 올리면 한글 설명이 뜹니다",
+                     text_color=MUTED, font=("", 10)).pack(side="left", padx=8)
+        self.bt_metrics = ctk.CTkTextbox(left, height=250, font=("Consolas", 12))
         self.bt_metrics.pack(fill="both", expand=False, padx=10, pady=(0, 10))
         self.bt_metrics.configure(state="disabled")
+        text_help(self.bt_metrics)
         self._refresh_param_list()
 
         right = ctk.CTkFrame(body, fg_color=CARD, corner_radius=8, width=470)
@@ -3334,8 +3616,10 @@ class ProfileDialog(ctk.CTkToplevel):
             for i, (k, dv) in enumerate(cls.default_params.items()):
                 cell = ctk.CTkFrame(grid, fg_color="transparent")
                 cell.grid(row=i // 3, column=i % 3, sticky="w", padx=(0, 14), pady=2)
-                ctk.CTkLabel(cell, text=k, width=125, anchor="w", text_color=MUTED,
+                _lb = App.PARAM_LABEL.get(k, k)
+                ctk.CTkLabel(cell, text=_lb, width=125, anchor="w", text_color=MUTED,
                              font=("", 10)).pack(side="left")
+                help_badge(cell, _lb, pad=(0, 4))
                 e = ctk.CTkEntry(cell, width=70, height=26)
                 e.insert(0, str(saved.get(k, dv)))
                 e.pack(side="left")

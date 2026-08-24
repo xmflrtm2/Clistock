@@ -98,6 +98,7 @@ class TradingEngine:
             self.emit("error", "활성화된 전략이 없습니다. [전략] 탭에서 하나 이상 켜주세요.")
             return
         self._warn_missing_data()
+        self._warn_unbuyable()
         self._stop.clear()
         self.risk.resume()
         self._thread = threading.Thread(target=self._loop, daemon=True, name="engine")
@@ -122,6 +123,43 @@ class TradingEngine:
                       f"일봉 부족으로 신호가 안 나올 종목 {len(thin)}개: "
                       f"{', '.join(thin[:8])}{' 외' if len(thin) > 8 else ''} "
                       f"- [데이터] 탭에서 일봉을 먼저 수집하세요 (필요 {need}봉)")
+
+    def _warn_unbuyable(self) -> None:
+        """지금은 몰빵 방지 규칙에 걸려 매수 대상에서 빠지는 종목을 알려준다.
+
+        현금이 모자란 게 아니다. 1주 값은 예수금으로 충분히 낼 수 있는데도
+        "한 종목에 자산의 N% 넘게 넣지 않는다"는 규칙이 1주조차 막는 경우다.
+        가격만으로 정해지므로 신호를 기다릴 필요 없이 미리 알 수 있고,
+        자산이 늘면 저절로 풀린다. 조치가 필요한 경고가 아니라 안내다.
+        """
+        try:
+            acct = self.account or self.refresh_account()
+        except Exception:
+            return
+        equity = float(acct.get("total_eval") or 0)
+        if equity <= 0:
+            return
+        c = self.cfg.risk
+        cap = min(equity * c.max_position_weight_pct / 100, float(c.max_order_amount))
+        if cap <= 0:
+            return
+
+        bad = []
+        for sym in self.cfg.watchlist:
+            bars = self.store.get_candles(sym, "D", limit=1)
+            px = float(bars[-1]["close"]) if bars else 0.0
+            if px > cap:
+                bad.append(f"{self._name(sym)}({px:,.0f}원)")
+        if not bad:
+            return
+        self.emit("warn",
+                  f"[안내] 지금 몰빵방지 규칙에 걸려 매수 대상에서 빠지는 관심종목 "
+                  f"{len(bad)}/{len(self.cfg.watchlist)}개: "
+                  f"{', '.join(bad[:6])}{' 외' if len(bad) > 6 else ''} - "
+                  f"현금은 충분하지만 한 종목에 넣을 수 있는 최대 금액이 "
+                  f"{cap:,.0f}원(자산 {equity:,.0f}원의 "
+                  f"{c.max_position_weight_pct}%)이라 1주 값이 그보다 큽니다. "
+                  f"자산이 늘면 저절로 풀리니 그냥 두셔도 됩니다.")
 
     def stop(self) -> None:
         self._stop.set()
@@ -413,6 +451,7 @@ class TradingEngine:
         buys: list[str] = []
         nears: list[str] = []
         gated: list[str] = []
+        zero: list[str] = []
 
         for symbol in self.cfg.watchlist:
             if self._stop.is_set():
@@ -431,6 +470,9 @@ class TradingEngine:
                     gated.append(f"{symbol}/{r['label']}")
                 elif r["verdict"] == "NEAR":
                     nears.append(f"{symbol}/{r['label']} {r['gap_pct']:+.2f}%")
+                if (r["verdict"] in ("BUY", "NEAR", "WAIT")
+                        and r.get("size_note") and not r.get("qty")):
+                    zero.append(symbol)
                 if self._should_record(symbol, r, now):
                     rows.append({
                         "ts": now.strftime("%Y-%m-%d %H:%M:%S"), "mode": self.mode,
@@ -455,13 +497,16 @@ class TradingEngine:
                f"신호 {len(buys)} / 근접 {len(nears)}")
         if gated:
             msg += f" / 관문차단 {len(gated)}"
+        if zero:
+            msg += f" / 신호나도 0주 {len(zero)}"
         if buys:
             msg += f" | 신호: {', '.join(buys[:4])}"
         elif gated:
             msg += f" | 차단: {', '.join(gated[:3])}"
         elif nears:
             msg += f" | 가장 가까움: {', '.join(nears[:3])}"
-        self.emit("scan", msg, {"buys": buys, "nears": nears, "gated": gated})
+        self.emit("scan", msg,
+                  {"buys": buys, "nears": nears, "gated": gated, "zero": zero})
         return out
 
     def _evaluate(self, symbol: str, now: datetime, held: set[str],
