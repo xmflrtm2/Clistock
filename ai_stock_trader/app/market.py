@@ -44,25 +44,45 @@ class MarketCalendar:
         return True, "평일(휴장일 미확인)"
 
     def prefetch_holidays(self, days: int = 60) -> int:
-        """앞으로 N일 휴장일을 미리 받아 캐시."""
+        """앞으로 days일 휴장일을 미리 받아 캐시.
+
+        휴장일 API는 1회 호출에 한 달 남짓만 돌려주므로, 마지막으로 받은
+        날짜의 다음 날을 기준일로 다시 호출하며 days만큼 앞으로 민다.
+        """
         if self.client is None:
             return 0
         n = 0
-        d = date.today()
-        try:
-            got = self.client._request(
-                "GET", "/uapi/domestic-stock/v1/quotations/chk-holiday", "CTCA0903R",
-                params={"BASS_DT": d.strftime("%Y%m%d"), "CTX_AREA_NK": "", "CTX_AREA_FK": ""},
-            )
+        cur = date.today()
+        limit = cur + timedelta(days=days)
+        for _ in range(6):                      # 호출당 약 한 달치 - 6번이면 넉넉하다
+            try:
+                got = self.client._request(
+                    "GET", "/uapi/domestic-stock/v1/quotations/chk-holiday", "CTCA0903R",
+                    params={"BASS_DT": cur.strftime("%Y%m%d"),
+                            "CTX_AREA_NK": "", "CTX_AREA_FK": ""},
+                )
+            except Exception as e:
+                log.debug("휴장일 사전조회 실패: %s", e)
+                break
+            latest = cur
             for row in got.get("output") or []:
                 bd = row.get("bass_dt")
-                if not bd:
+                if not bd or len(bd) != 8:
                     continue
                 iso = f"{bd[:4]}-{bd[4:6]}-{bd[6:8]}"
                 self.store.set_holiday(iso, row.get("opnd_yn") == "Y")
                 n += 1
-        except Exception as e:
-            log.debug("휴장일 사전조회 실패: %s", e)
+                try:
+                    d = date(int(bd[:4]), int(bd[4:6]), int(bd[6:8]))
+                    if d > latest:
+                        latest = d
+                except ValueError:
+                    pass
+            if latest <= cur:                   # 더 못 나아가면 그만
+                break
+            cur = latest + timedelta(days=1)
+            if cur > limit:
+                break
         return n
 
     def session(self, now: datetime | None = None) -> str:

@@ -70,9 +70,12 @@ CREATE TABLE IF NOT EXISTS trades (
 );
 CREATE INDEX IF NOT EXISTS ix_trades_open ON trades(open, symbol);
 
+-- PK는 (mode, ts) 복합키여야 한다. ts 하나만 PK로 두면 운용랩처럼
+-- 여러 모드가 같은 초에 기록할 때 INSERT OR REPLACE가 서로를 덮어쓴다.
 CREATE TABLE IF NOT EXISTS equity (
-    ts TEXT PRIMARY KEY, mode TEXT,
-    total_eval REAL, cash REAL, stock_eval REAL, day_pnl REAL
+    ts TEXT NOT NULL, mode TEXT NOT NULL DEFAULT '',
+    total_eval REAL, cash REAL, stock_eval REAL, day_pnl REAL,
+    PRIMARY KEY (mode, ts)
 );
 
 CREATE TABLE IF NOT EXISTS backtests (
@@ -148,6 +151,24 @@ class Store:
                     if name not in have:
                         c.execute(f"ALTER TABLE {table} ADD COLUMN {name} {typ}")
                         log.info("DB 마이그레이션: %s.%s 추가", table, name)
+
+            # equity PK가 ts 하나뿐인 옛 스키마 -> (mode, ts) 복합키로 재구성.
+            # 옛 스키마에서는 여러 모드(운용랩 프로필 등)가 같은 초에 기록하면
+            # INSERT OR REPLACE가 서로의 행을 지워 자산곡선이 유실됐다.
+            pk = [r[1] for r in c.execute("PRAGMA table_info(equity)") if r[5]]
+            if pk == ["ts"]:
+                c.execute("ALTER TABLE equity RENAME TO equity_old")
+                c.execute(
+                    "CREATE TABLE equity ("
+                    "ts TEXT NOT NULL, mode TEXT NOT NULL DEFAULT '',"
+                    "total_eval REAL, cash REAL, stock_eval REAL, day_pnl REAL,"
+                    "PRIMARY KEY (mode, ts))")
+                c.execute(
+                    "INSERT OR IGNORE INTO equity(ts,mode,total_eval,cash,stock_eval,day_pnl) "
+                    "SELECT ts, COALESCE(mode,''), total_eval, cash, stock_eval, day_pnl "
+                    "FROM equity_old")
+                c.execute("DROP TABLE equity_old")
+                log.info("DB 마이그레이션: equity PK -> (mode, ts)")
 
     # -- connection ---------------------------------------------------------
     def _get(self) -> sqlite3.Connection:
@@ -400,21 +421,44 @@ class Store:
                 c.execute("UPDATE trades SET peak_price=? WHERE id=?", (peak, trade_id))
 
     def close_trade(self, trade_id: int, exit_price: float, reason: str,
-                    fee: float, tax: float) -> dict | None:
+                    fee: float, tax: float, qty: int | None = None) -> dict | None:
+        """거래를 청산 처리한다.
+
+        qty(실제 체결수량)가 보유수량보다 적으면 - 부분체결 - 체결분만 닫고
+        잔량은 같은 진입 정보로 새 미결 거래 행에 남긴다. 전량을 닫은 것처럼
+        기록하면 실계좌에 남은 잔량이 엔진 관리(손절/트레일링)에서 빠진다.
+        """
         t = self.one("SELECT * FROM trades WHERE id=?", (trade_id,))
         if not t:
             return None
-        gross_in = (t["entry_price"] or 0) * (t["qty"] or 0)
-        gross_out = exit_price * (t["qty"] or 0)
-        total_fee = (t["fee"] or 0) + fee
+        total_qty = int(t["qty"] or 0)
+        q = min(int(qty), total_qty) if qty else total_qty
+        if q <= 0:
+            return None
+        entry_fee = float(t["fee"] or 0)
+        fee_part = entry_fee * q / total_qty if total_qty else entry_fee
+        gross_in = (t["entry_price"] or 0) * q
+        gross_out = exit_price * q
+        total_fee = fee_part + fee
         pnl = gross_out - gross_in - total_fee - tax
         pnl_pct = (pnl / gross_in * 100) if gross_in else 0.0
         with self.conn() as c:
-            c.execute("UPDATE trades SET exit_ts=?,exit_price=?,exit_reason=?,pnl=?,"
+            c.execute("UPDATE trades SET qty=?,exit_ts=?,exit_price=?,exit_reason=?,pnl=?,"
                       "pnl_pct=?,fee=?,tax=?,open=0 WHERE id=?",
-                      (_now(), exit_price, reason, pnl, pnl_pct, total_fee, tax, trade_id))
+                      (q, _now(), exit_price, reason, pnl, pnl_pct, total_fee, tax,
+                       trade_id))
+            if q < total_qty:
+                c.execute(
+                    "INSERT INTO trades(mode,symbol,strategy,entry_ts,entry_price,qty,fee,"
+                    "stop_price,target_price,peak_price,open) VALUES(?,?,?,?,?,?,?,?,?,?,1)",
+                    (t["mode"], t["symbol"], t["strategy"], t["entry_ts"],
+                     t["entry_price"], total_qty - q, entry_fee - fee_part,
+                     t["stop_price"], t["target_price"], t["peak_price"]))
+                log.warning("부분체결 청산: %s %d/%d주 - 잔량 %d주는 미결 거래로 유지",
+                            t["symbol"], q, total_qty, total_qty - q)
         d = dict(t)
-        d.update(pnl=pnl, pnl_pct=pnl_pct, exit_price=exit_price, exit_reason=reason)
+        d.update(qty=q, pnl=pnl, pnl_pct=pnl_pct, exit_price=exit_price,
+                 exit_reason=reason)
         return d
 
     def closed_trades(self, mode: str | None = None, limit: int = 500) -> list[dict]:
@@ -572,12 +616,19 @@ class Store:
         return len(data)
 
     def stock_count(self) -> int:
-        r = self.one("SELECT COUNT(*) n FROM stocks")
+        # set_sector가 만든 이름 없는 자리표시 행은 세지 않는다.
+        # 여기 수가 0이어야 GUI가 종목 마스터 자동 다운로드를 시도한다.
+        r = self.one("SELECT COUNT(*) n FROM stocks WHERE COALESCE(name,'') != ''")
         return r["n"] if r else 0
 
     def stock_name(self, symbol: str) -> str:
         r = self.one("SELECT name FROM stocks WHERE symbol=?", (symbol,))
-        return r["name"] if r else symbol
+        return (r["name"] or symbol) if r else symbol
+
+    def stock_market(self, symbol: str) -> str:
+        """종목의 소속 시장 (KOSPI/KOSDAQ). 마스터가 없으면 빈 문자열."""
+        r = self.one("SELECT market FROM stocks WHERE symbol=?", (symbol,))
+        return (r["market"] or "") if r else ""
 
     def search_stocks(self, q: str, limit: int = 60) -> list[dict]:
         """코드 정확일치 -> 이름 시작일치 -> 이름 포함 순으로 정렬."""
@@ -599,8 +650,15 @@ class Store:
     def set_sector(self, symbol: str, sector: str) -> None:
         if not sector:
             return
+        # UPDATE만 하면 종목 마스터를 아직 안 받은 사용자는 stocks에 행이 없어
+        # 조용히 무시되고, 업종 집중도 안전장치가 영영 발동하지 않는다.
+        # 행이 없으면 만들어서라도 sector는 남긴다 (name 등은 마스터 갱신이 채운다).
         with self.conn() as c:
-            c.execute("UPDATE stocks SET sector=? WHERE symbol=?", (sector, symbol))
+            c.execute(
+                "INSERT INTO stocks(symbol,name,market,std_code,sector,updated) "
+                "VALUES(?,?,?,?,?,?) "
+                "ON CONFLICT(symbol) DO UPDATE SET sector=excluded.sector",
+                (symbol, "", "", "", sector, _now()))
 
     def get_sector(self, symbol: str) -> str:
         r = self.one("SELECT sector FROM stocks WHERE symbol=?", (symbol,))

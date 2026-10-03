@@ -485,7 +485,7 @@ class Analyzer:
             "loss_prob": sum(1 for f in finals if f < 0) / len(finals) * 100,
             "ruin_prob": ruins / runs * 100,
             "verdict": (
-                f"거래 순서만 바뀌어도 수익률이 {pct(finals, 0.05):+.1f}% ~ "
+                f"같은 거래를 복원추출로 다시 뽑으면 수익률이 {pct(finals, 0.05):+.1f}% ~ "
                 f"{pct(finals, 0.95):+.1f}% 사이에서 움직입니다. "
                 f"손실로 끝날 확률 {sum(1 for f in finals if f < 0) / len(finals) * 100:.0f}%, "
                 f"최대낙폭은 나쁜 경우 {pct(mdds, 0.95):.1f}%까지 갑니다."
@@ -518,6 +518,8 @@ def suggest_values(param: str, current) -> list:
         "range_min": [10, 15, 30, 45, 60],
         "vol_filter": [0.0, 0.8, 1.0, 1.3, 1.8],
         "min_range_pct": [0.0, 0.5, 0.8, 1.2, 2.0],
+        "dip_min_pct": [10.0, 15.0, 20.0, 25.0, 30.0],
+        "dip_max_pct": [30.0, 35.0, 40.0, 50.0],
     }
     if param in presets:
         return presets[param]

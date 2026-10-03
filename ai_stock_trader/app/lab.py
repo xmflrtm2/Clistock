@@ -142,7 +142,9 @@ class Lab:
         cash = prof.initial_cash if prof else 10_000_000
         pb = PaperBroker(self.store, self.core.quote_client, self.core.cfg.cost,
                          cash, key=f"paper_account::{name}")
-        pb.reset(cash)
+        # mode 를 명시해야 한다. 안 넘기면 PaperBroker 기본값인 "PAPER" 모드의
+        # 기록(메인 가상계좌의 거래/주문/자산 이력)이 통째로 지워진다.
+        pb.reset(cash, mode=mode)
         with self.store.conn() as c:
             for t in ("trades", "orders", "signals", "equity"):
                 c.execute(f"DELETE FROM {t} WHERE mode=?", (mode,))

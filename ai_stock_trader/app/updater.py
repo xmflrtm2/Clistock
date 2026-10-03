@@ -117,13 +117,18 @@ def has_update(cfg=None) -> tuple[bool, Release]:
 
 
 # --------------------------------------------------------------------------
+def _host_allowed(url: str) -> bool:
+    from urllib.parse import urlparse
+    host = urlparse(url).netloc.lower()
+    return any(host == h or host.endswith("." + h) for h in ALLOWED_HOSTS)
+
+
 def download(rel: Release, dest_dir: Path | None = None, progress=None) -> Path:
     """릴리즈 exe를 내려받아 임시 파일 경로를 돌려준다."""
     from urllib.parse import urlparse
 
-    host = urlparse(rel.url).netloc.lower()
-    if not any(host == h or host.endswith("." + h) for h in ALLOWED_HOSTS):
-        raise ValueError(f"허용되지 않은 다운로드 주소입니다: {host}")
+    if not _host_allowed(rel.url):
+        raise ValueError(f"허용되지 않은 다운로드 주소입니다: {urlparse(rel.url).netloc}")
     if not rel.url.lower().startswith("https://"):
         raise ValueError("HTTPS가 아닌 주소입니다.")
 
@@ -134,6 +139,12 @@ def download(rel: Release, dest_dir: Path | None = None, progress=None) -> Path:
     with requests.get(rel.url, stream=True, timeout=60,
                       headers={"Accept": "application/octet-stream"}) as r:
         r.raise_for_status()
+        # GitHub은 자산을 objects.githubusercontent.com 등으로 리다이렉트한다.
+        # 최초 URL만 검사하면 중간 리다이렉트가 아무 데나 갈 수 있으므로
+        # 실제로 응답을 준 최종 URL도 같은 허용 목록으로 확인한다.
+        if not (_host_allowed(r.url) and str(r.url).lower().startswith("https://")):
+            raise ValueError(f"리다이렉트가 허용되지 않은 주소로 향했습니다: "
+                             f"{urlparse(str(r.url)).netloc}")
         total = int(r.headers.get("content-length") or rel.size or 0)
         done = 0
         with open(out, "wb") as f:

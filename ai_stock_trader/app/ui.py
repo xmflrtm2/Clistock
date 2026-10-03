@@ -370,9 +370,11 @@ class App(ctk.CTk):
         if self._busy:
             messagebox.showinfo("작업 중", "이미 실행 중인 작업이 있습니다.")
             return
+        # 스레드 시작 전에 잠가야 한다. 스레드 안에서 잠그면 연타 시
+        # 두 번째 클릭이 검사(_busy=False)를 먼저 통과해 작업이 겹친다.
+        self._busy = True
 
         def run():
-            self._busy = True
             try:
                 fn(*a, **kw)
             except Exception as e:
@@ -1310,23 +1312,30 @@ class App(ctk.CTk):
                       command=self._save_risk).pack(pady=10)
 
     def _save_risk(self) -> None:
+        # 전부 파싱해 통과한 뒤에만 반영한다. 반영하면서 파싱하면
+        # 중간에 오류가 나도 앞쪽 값들은 이미 바뀐 채로 남는다.
         try:
+            risk_new = {}
             for k, e in self.risk_fields.items():
                 cur = getattr(self.core.cfg.risk, k)
-                setattr(self.core.cfg.risk, k,
-                        int(float(e.get())) if isinstance(cur, int) else float(e.get()))
+                risk_new[k] = int(float(e.get())) if isinstance(cur, int) else float(e.get())
+            exec_new = {}
             for k, e in self.exec_fields.items():
                 cur = getattr(self.core.cfg.execution, k)
                 v = e.get().strip()
-                setattr(self.core.cfg.execution, k,
-                        v if isinstance(cur, str) else
-                        (int(float(v)) if isinstance(cur, int) else float(v)))
-            self.core.cfg.execution.order_type = self.opt_order.get()
-            for k, e in self.cost_fields.items():
-                setattr(self.core.cfg.cost, k, float(e.get()))
+                exec_new[k] = (v if isinstance(cur, str) else
+                               (int(float(v)) if isinstance(cur, int) else float(v)))
+            cost_new = {k: float(e.get()) for k, e in self.cost_fields.items()}
         except ValueError as ex:
             messagebox.showerror("입력 오류", f"숫자를 확인해주세요: {ex}")
             return
+        for k, v in risk_new.items():
+            setattr(self.core.cfg.risk, k, v)
+        for k, v in exec_new.items():
+            setattr(self.core.cfg.execution, k, v)
+        self.core.cfg.execution.order_type = self.opt_order.get()
+        for k, v in cost_new.items():
+            setattr(self.core.cfg.cost, k, v)
         self.core.save()
         self._log("리스크/실행 설정 저장 완료")
 
@@ -2422,13 +2431,14 @@ class App(ctk.CTk):
             return
         syms = self.core.cfg.watchlist
         say = lambda m: self.after(0, self._dlog, m)
+        # Tk 위젯은 메인 스레드에서만 읽는다 - 스레드 시작 전에 값을 확정
+        try:
+            days = int(float(self.e_days.get()))
+        except (ValueError, AttributeError):
+            days = 400
 
         def job():
             if kind == "daily":
-                try:
-                    days = int(float(self.e_days.get()))
-                except ValueError:
-                    days = 400
                 self.core.cfg.data.daily_history_days = days
                 self.core.save(rebuild=False)
                 self.core.collector.sync_daily_all(syms, days, say)
@@ -2501,7 +2511,7 @@ class App(ctk.CTk):
         self.core.cfg.ai.enabled = bool(self.sw_ai.get())
         self.core.cfg.ai.veto_filter = bool(self.sw_veto.get())
         self.core.cfg.ai.daily_review = bool(self.sw_review.get())
-        self.core.cfg.ai.model = self.e_model.get().strip() or "gemini-3.5-flash"
+        self.core.cfg.ai.model = self.e_model.get().strip() or "gemini-2.5-flash"
         self.core.save()
         self._log("AI 설정 저장 완료")
 

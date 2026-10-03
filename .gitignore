@@ -11,6 +11,7 @@
 ai_stock_trader/data/
 ai_stock_trader/logs/
 ai_stock_trader/config/settings.json
+ai_stock_trader/config/settings.json.bak
 ai_stock_trader/config/profiles.json
 *.db
 *.db-wal

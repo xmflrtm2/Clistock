@@ -17,7 +17,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 REPO_ROOT = ROOT.parent
 VERSION_FILE = ROOT / "app" / "version.py"
-EXE = ROOT / "KIS자동매매.exe"
+# build.py 의 NAME 과 같아야 한다 (릴리즈 자산명은 ASCII - GitHub이 한글을 잘라낸다)
+EXE = ROOT / "Clistock.exe"
 
 
 def run(cmd: list[str], cwd: Path = REPO_ROOT, check: bool = True) -> str:

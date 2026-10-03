@@ -207,9 +207,11 @@ class KISClient:
                                           data=json.dumps(body or {}), timeout=timeout)
 
                 if r.status_code == 401:
+                    last = KISError("HTTP 401: 토큰 만료/무효 (재발급 후에도 거부)")
                     self.token(force=True)
                     continue
                 if r.status_code == 429 or r.status_code >= 500:
+                    last = KISError(f"HTTP {r.status_code}: {r.text[:120]}")
                     time.sleep(0.5 * (2 ** attempt))
                     continue
                 if r.status_code != 200:

@@ -54,6 +54,13 @@ STYLE_RISK = {
         "max_drawdown_pct": 6.0, "max_positions": 2,
         "max_position_weight_pct": 12.0, "reentry_cooldown_min": 30,
         "max_orders_per_day": 40}),
+    # 조정 매수 - 장기 보유형이므로 장투와 같은 자금관리를 쓴다
+    "dip_buy": ("장기투자", {
+        "max_loss_per_trade_pct": 1.0, "max_daily_loss_pct": 5.0,
+        "max_drawdown_pct": 20.0, "max_positions": 6,
+        "max_position_weight_pct": 25.0, "reentry_cooldown_min": 1440,
+        "max_orders_per_day": 10, "min_cash_reserve_pct": 5.0,
+        "max_order_amount": 3_000_000, "max_consecutive_losses": 5}),
 }
 
 STYLE_EXEC = {
@@ -73,6 +80,7 @@ TUNE_PARAM = {
     "trend_pullback": "pullback_lookback",
     "volatility_breakout": "k",
     "opening_range_breakout": "range_min",
+    "dip_buy": "dip_min_pct",
 }
 
 GATES = {

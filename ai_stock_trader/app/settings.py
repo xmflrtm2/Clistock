@@ -243,7 +243,7 @@ class DataConfig:
 @dataclass
 class AIConfig:
     enabled: bool = True
-    model: str = "gemini-3.5-flash"
+    model: str = "gemini-2.5-flash"
     # AI 뉴스/공시 리스크 필터 (진입 거부만 가능, 진입 생성은 불가)
     veto_filter: bool = False
     # 장 마감 후 일일 리뷰 생성
@@ -325,6 +325,10 @@ def load_config(force: bool = False) -> AppConfig:
         else:
             _cache = AppConfig()
             _write(_cache)
+        # 예전 기본값이 존재하지 않는 모델명이었다. 설정 파일에 남아 있으면
+        # 모든 AI 호출이 조용히 실패하므로 여기서 바로잡는다.
+        if _cache.ai.model == "gemini-3.5-flash":
+            _cache.ai.model = "gemini-2.5-flash"
         return _cache
 
 

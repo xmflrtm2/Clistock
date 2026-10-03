@@ -18,7 +18,7 @@ import logging
 import math
 from dataclasses import dataclass, field
 
-from .risk import avg_turnover, round_trip_cost_pct
+from .risk import avg_turnover, norm_market, round_trip_cost_pct
 from .settings import CostConfig, RiskConfig
 from .storage import Store
 from .strategies import Position, Strategy, build
@@ -95,6 +95,33 @@ class Backtester:
         equity_curve: list[tuple[str, float]] = []
         day_mark = ""
 
+        # 시장 구분(코스피/코스닥) - 호가단위 기반 비용 관문을 실거래와 같은
+        # 기준으로 계산하기 위해. 종목 마스터가 없으면 KOSPI 로 본다.
+        markets = {s: norm_market(self.store.stock_market(s)) for s in data}
+
+        def settle_exit(sym: str, exit_px: float, ts_: str, reason: str) -> None:
+            """포지션 청산 정산 - 비용 차감, 거래 기록, 포지션 제거."""
+            nonlocal cash
+            pos = positions[sym]
+            fill = exit_px * (1 - self.cost.slippage_pct / 100)
+            amount = fill * pos.qty
+            fee = round(amount * self.cost.commission_pct / 100)
+            tax = round(amount * self.cost.sell_tax_pct / 100)
+            costs["fee"] += fee
+            costs["tax"] += tax
+            costs["slip"] += (exit_px - fill) * pos.qty
+            cash += amount - fee - tax
+            gross_in = pos.entry_price * pos.qty
+            pnl = amount - gross_in - fee - tax - pos.fee
+            trades.append({
+                "symbol": sym, "entry_ts": pos.entry_ts, "exit_ts": ts_,
+                "entry_price": pos.entry_price, "exit_price": fill,
+                "qty": pos.qty, "pnl": pnl,
+                "pnl_pct": (pnl / gross_in * 100) if gross_in else 0,
+                "reason": reason, "bars": pos.bars_held,
+            })
+            del positions[sym]
+
         for ti, ts in enumerate(timeline):
             day = ts[:10]
             is_last_of_day = (ti == len(timeline) - 1) or (timeline[ti + 1][:10] != day)
@@ -136,24 +163,7 @@ class Backtester:
                     pos.stop, pos.peak = new_stop, max(pos.peak, c)
                     continue
 
-                fill = exit_px * (1 - self.cost.slippage_pct / 100)
-                amount = fill * pos.qty
-                fee = round(amount * self.cost.commission_pct / 100)
-                tax = round(amount * self.cost.sell_tax_pct / 100)
-                costs["fee"] += fee
-                costs["tax"] += tax
-                costs["slip"] += (exit_px - fill) * pos.qty
-                cash += amount - fee - tax
-                gross_in = pos.entry_price * pos.qty
-                pnl = amount - gross_in - fee - tax - pos.fee
-                trades.append({
-                    "symbol": sym, "entry_ts": pos.entry_ts, "exit_ts": ts,
-                    "entry_price": pos.entry_price, "exit_price": fill,
-                    "qty": pos.qty, "pnl": pnl,
-                    "pnl_pct": (pnl / gross_in * 100) if gross_in else 0,
-                    "reason": reason, "bars": pos.bars_held,
-                })
-                del positions[sym]
+                settle_exit(sym, exit_px, ts, reason)
 
             # ---------- 2) 진입 ----------
             equity = cash + sum(
@@ -190,12 +200,12 @@ class Backtester:
                         continue
 
                     fill = entry_px * (1 + self.cost.slippage_pct / 100)
-                    costs["slip"] += (fill - entry_px) * 0   # 수량 확정 후 아래에서 더한다
                     stop = sig.stop if sig.stop > 0 else fill * 0.97
                     target = sig.target if sig.target > 0 else 0
 
                     # 실거래와 같은 관문. 여기서 거른 거래는 실계좌에서도 안 산다.
-                    gate = self._gate(fill, stop, target, hist)
+                    gate = self._gate(fill, stop, target, hist,
+                                      markets.get(sym, "KOSPI"))
                     if gate:
                         gated[gate] += 1
                         continue
@@ -212,6 +222,21 @@ class Backtester:
                     cash -= amount + fee
                     positions[sym] = BTPosition(sym, qty, fill, ts, stop, target,
                                                 fill, 0, float(fee))
+
+                    # ---------- 진입 당일(같은 봉) 청산 ----------
+                    # 청산 루프는 다음 봉부터 이 포지션을 보므로, 여기서 안 보면
+                    # "당일 종가 청산" 전략(일봉)이 실제로는 다음날 종가에 나가
+                    # 오버나이트가 하루 더 붙는다. 실거래 엔진은 당일 안에
+                    # 손절/익절/강제청산을 전부 처리하므로 백테스트도 진입 봉에서
+                    # 손절 우선(최악 가정) -> 익절 -> 종가청산 순으로 본다.
+                    npos = positions[sym]
+                    lo_, cl_ = float(bar["low"]), float(bar["close"])
+                    if npos.stop > 0 and lo_ <= npos.stop:
+                        settle_exit(sym, npos.stop, ts, "손절")
+                    elif npos.target > 0 and h >= npos.target:
+                        settle_exit(sym, npos.target, ts, "익절")
+                    elif strat.exit_on_close and is_last_of_day:
+                        settle_exit(sym, cl_, ts, "당일 종가 청산")
 
             # ---------- 3) 자산 기록 ----------
             if is_last_of_day and day != day_mark:
@@ -245,7 +270,7 @@ class Backtester:
 
     # ------------------------------------------------------------------
     def _gate(self, price: float, stop: float, target: float,
-              hist: list[dict]) -> str:
+              hist: list[dict], market: str = "KOSPI") -> str:
         """진입을 취소해야 하면 사유 키를, 통과면 빈 문자열을 돌려준다.
 
         실거래 엔진(risk.py)이 쓰는 것과 같은 식이다. 백테스트에서만 통과하는
@@ -254,8 +279,9 @@ class Backtester:
         c = self.risk
         need = float(getattr(c, "min_edge_cost_ratio", 0) or 0)
         if need > 0 and price > 0:
-            edge = ((target - price) / price * 100) if target > 0 else                    ((price - stop) / price * 100)
-            cpct = round_trip_cost_pct(self.cost, price)
+            edge = (((target - price) / price * 100) if target > 0
+                    else ((price - stop) / price * 100))
+            cpct = round_trip_cost_pct(self.cost, price, market)
             if edge > 0 and cpct > 0 and edge / cpct < need:
                 return "cost"
 
@@ -334,21 +360,28 @@ class Backtester:
     # ------------------------------------------------------------------
     def _size(self, price: float, stop: float, equity: float,
               cash: float, strength: float) -> int:
+        """실거래 사이징(risk.RiskManager.position_size)과 같은 규칙.
+
+        여기가 실거래와 다르면 백테스트 수익률은 실계좌에서 재현되지 않는다.
+        """
         c = self.risk
         stop_dist = price - stop if stop > 0 else price * 0.03
         if stop_dist <= 0:
             stop_dist = price * 0.03
         risk_amt = equity * c.max_loss_per_trade_pct / 100 * max(min(strength, 1.0), 0.1)
-        qty = min(
-            risk_amt / stop_dist,
-            (equity * c.max_position_weight_pct / 100) / price,
-            max(cash - equity * c.min_cash_reserve_pct / 100, 0) / price,
-            c.max_order_amount / price,
-        )
-        q = int(math.floor(qty))
+        qty_risk = risk_amt / stop_dist
+        qty_weight = (equity * c.max_position_weight_pct / 100) / price
+        qty_cash = max(cash - equity * c.min_cash_reserve_pct / 100, 0) / price
+        qty_cap = c.max_order_amount / price
+
+        q = int(math.floor(min(qty_risk, qty_weight, qty_cash, qty_cap)))
+        if q <= 0:
+            return 0
         if q * price < c.min_order_amount:
+            # 실거래와 동일: 손실한도는 넘겨도 비중/현금/1회상한 안에서만
+            # 최소주문금액을 맞춘다. 그 밖이면 사지 않는다.
             need = math.ceil(c.min_order_amount / price)
-            q = need if need * price <= cash and need <= qty * 3 else 0
+            q = need if need <= min(qty_weight, qty_cash, qty_cap) else 0
         return max(q, 0)
 
     # ------------------------------------------------------------------

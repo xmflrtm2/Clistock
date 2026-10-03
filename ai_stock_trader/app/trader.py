@@ -195,7 +195,11 @@ class TradingEngine:
         self.last_loop = now
         session = self.cal.session(now)
 
-        if session in ("closed", "pre_auction"):
+        # "after"(15:30 이후)도 장외 처리로 보내야 한다. 매매 경로로 흘리면
+        # 장이 끝난 뒤에도 강제청산 주문을 반복 시도하고, 정작 거래일의
+        # 장 마감 후 처리(일봉/분봉 수집 + AI 리뷰)는 한 번도 돌지 않는다
+        # (거래일 16시의 세션이 "after"라서 예전 조건으로는 닿지 않았다).
+        if session in ("closed", "pre_auction", "after"):
             self._after_hours(now, session)
             return
 
@@ -392,8 +396,11 @@ class TradingEngine:
             return None
         try:
             qty = int(trade["qty"])
-            avail = (self.account.get("holdings", {}).get(symbol, {}) or {}).get("sellable", qty)
-            qty = min(qty, int(avail) or qty)
+            avail = (self.account.get("holdings", {}).get(symbol, {}) or {}).get("sellable")
+            if avail is not None:
+                # 브로커가 매도가능 0을 주면 정말 0으로 취급한다.
+                # (예전의 `int(avail) or qty`는 0을 전량으로 되돌려 실패 주문을 반복했다)
+                qty = min(qty, int(avail))
             if qty <= 0:
                 self.emit("error", f"{symbol} 매도가능 수량 0 - 청산 보류")
                 return None
@@ -409,7 +416,10 @@ class TradingEngine:
             self.store.add_fill(oid, symbol, "SELL", r.filled_qty, r.avg_price, r.fee, r.tax)
             self._filled_this_tick += 1
             self.broker.invalidate_account()
-            closed = self.store.close_trade(trade["id"], r.avg_price, reason, r.fee, r.tax)
+            # 실제 체결수량으로 닫는다. 부분체결이면 잔량은 미결 거래로 남아
+            # 다음 루프에서도 손절/트레일링 관리를 계속 받는다.
+            closed = self.store.close_trade(trade["id"], r.avg_price, reason,
+                                            r.fee, r.tax, qty=r.filled_qty)
             if closed:
                 pnl = closed["pnl"]
                 self.risk.on_trade_closed(pnl)
@@ -534,6 +544,10 @@ class TradingEngine:
             "held": symbol in held,
             "halt": q.get("halt") == "Y",
             "warn": str(q.get("market_warn", "00")) not in ("00", ""),
+            # AI veto 프롬프트가 판단 근거로 쓰는 값들 - 스냅샷에 실어 둔다
+            "upper_limit": float(q.get("upper_limit") or 0),
+            "lower_limit": float(q.get("lower_limit") or 0),
+            "market_warn": str(q.get("market_warn") or "00"),
             "blocked": blocked,
             "atr_pct": 0.0,
             "market": market,
@@ -691,8 +705,15 @@ class TradingEngine:
         equity = float(acct["total_eval"] or 0)
         cash = float(acct["orderable_cash"] or acct["cash"] or 0)
         sector = snap.get("sector") or ""
+        # AI veto 프롬프트가 참조하는 필드를 전부 채운다.
+        # price/change_pct/volume만 넘기면 정작 "막아야 할 근거"인
+        # 상하한가/시장경보/거래정지가 전부 None으로 들어간다.
         q = {"price": price, "change_pct": snap.get("change_pct", 0),
-             "volume": snap.get("volume", 0)}
+             "volume": snap.get("volume", 0),
+             "upper_limit": snap.get("upper_limit") or 0,
+             "lower_limit": snap.get("lower_limit") or 0,
+             "market_warn": snap.get("market_warn") or "00",
+             "halt": "Y" if snap.get("halt") else "N"}
 
         sid = self.store.add_signal(symbol, strat.name, "BUY", price,
                                     sig.strength, sig.reason, self.mode)
