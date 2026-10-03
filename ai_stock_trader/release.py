@@ -102,7 +102,7 @@ def main() -> int:
         print("  git push && git push origin " + tag)
         print()
         print("(직접 빌드해 올리려면:  python release.py "
-              f"{new} --local  — 단, 태그를 지우고 다시 실행해야 합니다)")
+              f"{new} --local  - 단, 태그를 지우고 다시 실행해야 합니다)")
     return 0
 
 
