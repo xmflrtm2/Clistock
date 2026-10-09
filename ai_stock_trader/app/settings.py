@@ -253,7 +253,11 @@ class AIConfig:
 def _default_strategies() -> list:
     """전략 기본 파라미터는 전략 클래스가 유일한 출처다 (설정과 코드가 어긋나지 않게)."""
     from .strategies import REGISTRY
-    enabled_by_default = {"volatility_breakout"}
+    # 2026-10 재검증: 조정 매수가 유일하게 관문을 통과했다 (README 성과표).
+    # 변동성 돌파는 비용 구조상 -63%로 결론 - 기본으로 켜 두면 안 된다.
+    # 여러 전략을 한 계좌에 같이 켜면 종목을 서로 선점해 수익이 죽는 것도
+    # 확인됐다 (단독 +114% vs 결합 +3~5%). 비교는 운용랩의 분리 계좌로 할 것.
+    enabled_by_default = {"dip_buy"}
     return [
         asdict(StrategyConfig(name, name in enabled_by_default, dict(cls.default_params)))
         for name, cls in REGISTRY.items()

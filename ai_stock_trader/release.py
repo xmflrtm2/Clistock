@@ -45,7 +45,12 @@ def ensure_clean() -> None:
     if run(["git", "status", "--porcelain"]):
         print("커밋되지 않은 변경이 있습니다:")
         print(run(["git", "status", "--short"]))
-        if input("그대로 함께 커밋할까요? [y/N] ").strip().lower() != "y":
+        try:
+            ans = input("그대로 함께 커밋할까요? [y/N] ").strip().lower()
+        except EOFError:          # 비대화식(스케줄러/파이프) 실행
+            raise SystemExit("커밋되지 않은 변경이 있어 중단했습니다. "
+                             "먼저 커밋하거나 대화식 터미널에서 실행하세요.")
+        if ans != "y":
             raise SystemExit("중단했습니다.")
 
 

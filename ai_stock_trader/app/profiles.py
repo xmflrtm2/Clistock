@@ -64,6 +64,31 @@ def builtin_profiles() -> list[Profile]:
     """기본 제공 프리셋. 여기서 값을 조금씩 바꿔가며 비교하면 된다."""
     return [
         Profile(
+            name="조정 매수(추천)",
+            horizon="long",
+            description=("52주 고점 대비 눌린 종목의 반등을 사서 넓은 트레일링으로 "
+                         "오래 태운다. 2026-10 재검증에서 유일하게 관문을 통과한 전략 "
+                         "(학습 +114% / 홀드아웃 +203% / 손실확률 13%)."),
+            initial_cash=10_000_000,
+            strategies=[_strat("dip_buy")],
+            risk={
+                "max_loss_per_trade_pct": 1.0,   # 0.5%는 소액 계좌에서 1주 절사로 수익 실종
+                "max_daily_loss_pct": 5.0,
+                # 이 전략의 기대 MDD가 32%라 20%로 두면 상시 정지된다.
+                # 실전 전환 시에는 본인이 견딜 수 있는 값으로 내릴 것.
+                "max_drawdown_pct": 30.0,
+                "max_positions": 6,
+                "max_position_weight_pct": 25.0,
+                "reentry_cooldown_min": 1440,
+                "max_orders_per_day": 10,
+                "min_cash_reserve_pct": 5.0,
+                "max_order_amount": 3_000_000,
+                "max_consecutive_losses": 5,
+            },
+            execution={"force_exit_at": "", "entry_start": "09:30", "entry_end": "15:00",
+                       "loop_interval_sec": 120},
+        ),
+        Profile(
             name="장기투자",
             horizon="long",
             description="200일선 위 추세를 끝까지 들고 간다. 익절 목표 없이 트레일링만.",

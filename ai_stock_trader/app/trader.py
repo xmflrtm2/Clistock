@@ -161,9 +161,15 @@ class TradingEngine:
                   f"{c.max_position_weight_pct}%)이라 1주 값이 그보다 큽니다. "
                   f"자산이 늘면 저절로 풀리니 그냥 두셔도 됩니다.")
 
-    def stop(self) -> None:
+    def stop(self, join: bool = False, timeout: float = 90.0) -> None:
         self._stop.set()
         self.emit("engine", "엔진 정지 요청")
+        # 주문 체결 대기(_wait_fill 최대 60초) 도중 프로세스가 끝나면 서버에는
+        # 주문이 나갔는데 체결/거래 기록이 안 남는다 (엔진이 모르는 포지션 발생).
+        # 종료 직전에는 join=True 로 진행 중인 틱이 끝나기를 기다릴 것.
+        t = self._thread
+        if join and t and t.is_alive() and t is not threading.current_thread():
+            t.join(timeout)
 
     def panic_close_all(self) -> None:
         """킬 스위치 - 엔진이 연 포지션 전량 시장가 청산."""
@@ -177,6 +183,14 @@ class TradingEngine:
 
     # -- 메인 루프 ----------------------------------------------------------
     def _loop(self) -> None:
+        # 시작하자마자 휴장일을 미리 캐시한다. 16시 마감 처리까지 기다리면
+        # 하루 종일 장 판정을 단건 API 호출(실패 시 내장 표)에만 기대게 된다.
+        try:
+            n = self.cal.prefetch_holidays()
+            if n:
+                self.emit("data", f"휴장일 {n}건 캐시")
+        except Exception as e:
+            log.debug("휴장일 사전조회 실패: %s", e)
         while not self._stop.is_set():
             started = time.monotonic()
             try:

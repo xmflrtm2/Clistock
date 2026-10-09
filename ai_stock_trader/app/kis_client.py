@@ -93,11 +93,18 @@ class KISClient:
         self._token_exp: datetime | None = None
         self._token_lock = threading.Lock()
         self._limiter = _RateLimiter(2 if creds.is_mock else 15)
+        # KIS 호출 한도는 appkey 단위다. GUI 와 무인 러너처럼 같은 키를 쓰는
+        # 프로세스가 동시에 돌면 각자의 리미터로는 한도를 넘는다.
+        # 그런 경우 throttle_share(2) 로 한도를 나눠 쓴다.
         self._store = get_store()
         # 모의투자 서버는 정상일 때도 느리다 (잔고 4~13초, 실전은 0.05초).
         # 실전 기준으로 타임아웃을 잡으면 모의가 멀쩡한데도 계속 실패한다.
         # 어차피 백그라운드 스레드에서 도니까 길게 잡아도 화면은 멈추지 않는다.
         self.timeout = (5, 30) if creds.is_mock else (5, 10)
+
+    def throttle_share(self, parts: int = 2) -> None:
+        """같은 appkey 를 쓰는 프로세스가 더 있을 때 호출 한도를 1/parts 로 줄인다."""
+        self._limiter.per_sec = max(1.0, self._limiter.per_sec / max(parts, 1))
 
     # -- 토큰 ---------------------------------------------------------------
     @property

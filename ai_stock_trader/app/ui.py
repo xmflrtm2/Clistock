@@ -303,6 +303,26 @@ class App(ctk.CTk):
         self._log("시스템 준비 완료. [설정] 탭에서 연결을 먼저 점검하세요.")
         if self.core.status_msg:
             self._log(f"[알림] {self.core.status_msg}")
+        self._share_api_budget()
+
+    def _share_api_budget(self) -> None:
+        """무인 러너(tools/auto_trade.py)가 떠 있으면 appkey 호출 한도를 나눠 쓴다.
+
+        KIS 레이트리밋은 appkey 단위인데 리미터는 프로세스 안에서만 세므로,
+        러너와 GUI가 동시에 돌면 합산 호출이 한도를 넘어 간헐적 조회 실패가 난다.
+        러너의 잠금 포트(47603)로 가동 여부를 감지한다.
+        """
+        import socket
+        try:
+            with socket.create_connection(("127.0.0.1", 47603), timeout=0.3):
+                pass
+        except OSError:
+            return
+        for c in (self.core.quote_client, self.core.trade_client):
+            if c:
+                c.throttle_share(2)
+        self._log("자동매매 러너 감지 - API 호출 한도를 절반으로 나눠 씁니다. "
+                  "러너가 도는 동안 [대시보드]의 엔진은 켜지 마세요 (주문 중복).")
 
     # ==================================================================
     # 공통
@@ -363,6 +383,12 @@ class App(ctk.CTk):
             return
         box.configure(state="normal")
         box.insert("end", f"{datetime.now():%H:%M:%S} {tag} {msg}\n")
+        # 트레이 상주로 몇 주씩 살 수 있으므로 로그가 무한히 쌓이면 안 된다
+        try:
+            if int(box.index("end-1c").split(".")[0]) > 5000:
+                box.delete("1.0", "2001.0")
+        except Exception:
+            pass
         box.see("end")
         box.configure(state="disabled")
 
@@ -3244,6 +3270,19 @@ class App(ctk.CTk):
                     return
 
     def _quit(self) -> None:
+        """X 버튼 - 끄지 않고 트레이(숨겨진 아이콘)로 보낸다.
+
+        엔진/가상운용이 백그라운드에서 돌고 있어도 창을 닫는 실수로 멈추지
+        않게 하기 위해서다. 진짜 종료는 트레이 아이콘의 [종료] 메뉴로 한다.
+        pystray 가 없으면 예전처럼 바로 종료한다.
+        """
+        if self._hide_to_tray():
+            self._log("창을 트레이로 보냈습니다. 작업표시줄 숨겨진 아이콘(^)에서 "
+                      "열기/종료할 수 있습니다.")
+            return
+        self._quit_now()
+
+    def _quit_now(self) -> None:
         if self.core.lab and self.core.lab.running_names():
             if not messagebox.askyesno(
                     "종료", f"가상운용 {len(self.core.lab.running_names())}개가 돌고 있습니다. "
@@ -3253,8 +3292,99 @@ class App(ctk.CTk):
         if self.core.engine and self.core.engine.running:
             if not messagebox.askyesno("종료", "엔진이 가동 중입니다. 정지하고 종료할까요?"):
                 return
-            self.core.engine.stop()
+            # 주문 체결 대기 중에 창을 죽이면 서버에 나간 주문이 기록 없이 남는다
+            self._log("엔진 정지 중 - 진행 중인 주문/기록을 마무리하고 종료합니다…")
+            self.update_idletasks()
+            self.core.engine.stop(join=True, timeout=90)
+        self._tray_close()
         self.destroy()
+
+    # ------------------------------------------------------------------
+    # 트레이 (숨겨진 아이콘)
+    # ------------------------------------------------------------------
+    def _hide_to_tray(self) -> bool:
+        """창을 숨기고 트레이 아이콘을 띄운다. 트레이를 못 쓰면 False."""
+        try:
+            import pystray
+            from PIL import Image
+        except ImportError:
+            return False
+        if getattr(self, "_tray", None):     # 이미 트레이에 있음
+            self.withdraw()
+            return True
+        try:
+            img = Image.open(icon_png())
+        except Exception:
+            return False
+
+        self._tray_req = None
+        # pystray 는 stop() 을 "아이콘 스레드가 준비된 뒤"에만 받아들인다
+        # (_running 가드로 조용히 무시됨). 준비 완료를 이벤트로 받아 둬야
+        # 생성 직후 종료 경로에서 stop() 이 씹혀 비데몬 스레드가 남는 걸 막는다.
+        self._tray_ready = threading.Event()
+
+        def _req(action):
+            # pystray 콜백은 별도 스레드에서 오므로 플래그만 세우고
+            # 실제 Tk 작업은 _tray_poll(메인 루프)에서 처리한다.
+            def go(icon=None, item=None):
+                self._tray_req = action
+            return go
+
+        def _setup(icon):
+            icon.visible = True
+            self._tray_ready.set()
+
+        menu = pystray.Menu(
+            pystray.MenuItem("열기", _req("show"), default=True),
+            pystray.MenuItem("종료", _req("quit")),
+        )
+        self._tray = pystray.Icon("clistock", img, "KIS 자동매매", menu)
+        try:
+            self._tray.run_detached(_setup)
+        except Exception:
+            self._tray = None
+            return False
+        self.withdraw()
+        self.after(300, self._tray_poll)
+        return True
+
+    def _tray_poll(self) -> None:
+        # pop 은 원자적이라, 읽기와 클리어 사이에 콜백 스레드가 쓴 값을
+        # 덮어쓰는 레이스가 없다 (pop 이후의 쓰기는 다음 폴에서 처리된다).
+        req = self.__dict__.pop("_tray_req", None)
+        if req == "show":
+            self._tray_close()
+            self.deiconify()
+            self.lift()
+            self.after(50, self._maximize)
+            return
+        if req == "quit":
+            self._tray_close()
+            self.deiconify()
+            self.after(50, self._quit_now)
+            return
+        if getattr(self, "_tray", None):
+            self.after(300, self._tray_poll)
+
+    def _tray_close(self) -> None:
+        t = getattr(self, "_tray", None)
+        self._tray = None
+        if t:
+            ev = getattr(self, "_tray_ready", None)
+            if ev is not None:
+                ev.wait(5)         # 아이콘 스레드 준비 전의 stop()은 무시되므로
+            try:
+                t.stop()
+            except Exception:
+                pass
+
+    def destroy(self) -> None:
+        # 어떤 경로로 창이 죽든(X, 자동 업데이트의 destroy 등) 트레이 아이콘을
+        # 먼저 정리해야 한다. pystray 스레드는 데몬이 아니라서, 안 멈추면
+        # 프로세스가 끝나지 않고 - 자동 업데이트의 교체 스크립트는 PID 종료를
+        # 기다리다 포기해 업데이트가 조용히 취소된다.
+        self._tray_close()
+        super().destroy()
 
 
 class WatchDetailDialog(ctk.CTkToplevel):
@@ -3788,4 +3918,10 @@ def _coerce(v: str):
 
 
 def run() -> None:
-    App().mainloop()
+    app = App()
+    try:
+        app.mainloop()
+    finally:
+        # Ctrl+C 등 예외로 mainloop 을 벗어나도 트레이 스레드(비데몬)를 꼭
+        # 정지시킨다. 안 그러면 창 없는 좀비 프로세스가 트레이 아이콘과 함께 남는다.
+        app._tray_close()

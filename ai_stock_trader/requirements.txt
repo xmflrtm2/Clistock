@@ -2,3 +2,5 @@ requests>=2.31
 python-dotenv>=1.0
 customtkinter>=5.2
 google-genai>=1.0
+pystray>=0.19      # 트레이(숨겨진 아이콘) 최소화
+pillow>=10.0       # 트레이 아이콘 이미지
